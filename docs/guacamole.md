@@ -26,7 +26,8 @@ as coming from a device tree (DT) or Linux.
 | Stock removable apps (Calculator, Weather, Notes, ...) | installed from staged_system_apps (userland/sysapps, sweetcsoff=1 once) |
 | Photos, Settings > About, Wallet | work (0135 sandbox extensions; fairplayd job removed) |
 | Wallpaper picker, app extensions | work (0137 AMFI trust stand-in + ADT mac-address-*; once `lsreg -r`): all 10 poster providers |
-| Wi-Fi, audio, CPU frequency | not started (Wi-Fi: port of ios-flame's wland, same SM8150/WCN3990) |
+| Wi-Fi | modem boots from userland (0138 /dev/pmem, userland/wland from ios-flame), WLFW mission mode, WMI/HTT up, passive scans list networks (wifi1); join and Settings next |
+| Audio, CPU frequency | not started |
 
 ## Workflow
 

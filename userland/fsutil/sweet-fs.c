@@ -17,6 +17,8 @@
  *   sweet-fs aside ID SUBPATH PREFIX
  *       In ID's container, renames each entry of SUBPATH whose name starts
  *       with PREFIX to NAME.bak (e.g. lsd's database).
+ *   sweet-fs mkdir PATH
+ *       Creates PATH and its missing parents (mode 0755).
  *   sweet-fs kill NAME
  *       SIGTERM to every process called NAME (launchd starts a daemon again
  *       on demand).
@@ -193,6 +195,29 @@ aside(const char *bundle_id, const char *sub, const char *prefix)
 }
 
 static int
+make_dirs(const char *path)
+{
+	char p[PATH_MAX];
+	snprintf(p, sizeof(p), "%s", path);
+	for (char *c = p + 1; ; c++) {
+		if (*c == '/' || *c == '\0') {
+			char saved = *c;
+			*c = '\0';
+			if (mkdir(p, 0755) != 0 && errno != EEXIST) {
+				printf("SWEET FS: mkdir %s: %s\n", p, strerror(errno));
+				return 1;
+			}
+			*c = saved;
+			if (saved == '\0') {
+				break;
+			}
+		}
+	}
+	printf("SWEET FS: mkdir %s: done\n", path);
+	return 0;
+}
+
+static int
 kill_named(const char *name)
 {
 	int pids[4096];
@@ -230,10 +255,13 @@ main(int argc, char *argv[])
 	if (argc == 5 && strcmp(argv[1], "aside") == 0) {
 		return aside(argv[2], argv[3], argv[4]);
 	}
+	if (argc == 3 && strcmp(argv[1], "mkdir") == 0) {
+		return make_dirs(argv[2]);
+	}
 	if (argc == 3 && strcmp(argv[1], "kill") == 0) {
 		return kill_named(argv[2]);
 	}
 	fprintf(stderr, "usage: %s container ID [SUBPATH] | ls PATH [DEPTH] | mv FROM TO | aside ID SUBPATH PREFIX"
-	    " | kill NAME\n", argv[0]);
+	    " | mkdir PATH | kill NAME\n", argv[0]);
 	return 2;
 }

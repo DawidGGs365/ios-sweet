@@ -209,6 +209,7 @@ Branch `guacamole` ports the same kernel and userland to the OnePlus 7 Pro (SM81
 | `sweetmailbox=1 sweetboxpart=rawdump sweetboxroot=1` | Unpack a SWEETBOX drop (and its `ROOT/` entries) |
 | `sweettime=SECONDS` | Unix time now, for the RTC offset (added by `guac-mkboot.sh`) |
 | `sweetbattery=2` | Real battery state from the PM8150B fuel gauge and charger (default: static 100 %) |
+| `sweetpmem=1` | `/dev/pmem` for `wland` (root gets all physical memory: development only) |
 | `sweetcsoff=1` | Tell installd and FrontBoard that code signing enforcement is off (only needed to install the staged system apps; makes driverkitd crash-loop) |
 
 ## Kernel patches
@@ -248,6 +249,7 @@ Branch `guacamole` ports the same kernel and userland to the OnePlus 7 Pro (SM81
 | 0135 | Sandbox extension tokens (tccd grants: Photos) |
 | 0136 | PM8150B fuel gauge battery (`sweetbattery=2`) |
 | 0137 | `AppleMobileFileIntegrity` stand-in answering trust cache queries (ios-flame 0103), so LaunchServices registers app extensions |
+| 0138 | `/dev/pmem` (physical memory, SCM calls, RPMh votes) for userland drivers, `sweetpmem=1` (ios-flame 0094/0102) |
 
 ## Key hardware facts
 
