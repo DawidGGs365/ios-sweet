@@ -27,7 +27,9 @@
 #define LOG(fmt, ...)	printf("[%6llu] radio: " fmt "\n", (unsigned long long)link_ms(), ##__VA_ARGS__)
 #define MIN(a, b)	((a) < (b) ? (a) : (b))
 
-const uint8_t radio_mac[6] = { 0x02, 0x50, 0x49, 0x58, 0x45, 0x4c };	/* what WLFW was given (wlfw.c) */
+/* guacamole: the firmware's own MAC, taken from WMI READY (flame's 02:50:49:58:45:4c stayed here while
+ * wlfw.c gave the firmware another one: the vdev was created with a MAC the firmware did not have) */
+uint8_t radio_mac[6] = { 0x02, 0x53, 0x57, 0x45, 0x45, 0x01 };
 
 /* ---------------------------------------------------------------- host memory */
 
@@ -393,7 +395,7 @@ static void htc_connect(uint16_t svc)
 }
 
 /* WMI waits here while its endpoint has no credit */
-#define WMIQ_LEN	8
+#define WMIQ_LEN	32	/* guacamole: the pdev setup before the scan is more than 8 messages (as ios-sunfish) */
 #define WMIQ_MAX	2040
 static uint8_t wmiq[WMIQ_LEN][WMIQ_MAX];
 static uint16_t wmiq_len[WMIQ_LEN];
@@ -517,6 +519,7 @@ static void htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
 #define TAG_ARRAY_STRUCT	0x12
 #define TAG_ARRAY_FIXED_STRUCT	0x13
 #define TAG_SERVICE_READY	0x20
+#define TAG_HAL_REG_CAP		0x21	/* guacamole */
 #define TAG_HOST_MEM_REQ	0x22
 #define TAG_READY_EVENT		0x23
 #define TAG_SCAN_EVENT		0x24
@@ -528,6 +531,18 @@ static void htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
 #define TAG_SCAN_CHAN_LIST_CMD	0x4f
 #define TAG_CHANNEL		0x50
 #define TAG_VDEV_CREATE_CMD	0x56
+#define TAG_PDEV_SET_REGDOMAIN	0x51	/* guacamole */
+#define TAG_VDEV_TXRX_STREAMS	0x19b	/* guacamole */
+#define TAG_PDEV_SET_PARAM	0x52	/* guacamole */
+#define TAG_VDEV_SET_PARAM	0x5f
+#define CMD_PDEV_SET_PARAM	0x4003
+#define CMD_VDEV_SET_PARAM	0x5008
+#define CMD_DBGLOG_CFG		0x1d003	/* guacamole: qcacld WMI_DBGLOG_CFG_CMDID (WMI_GRP_MISC) */
+#define TAG_DEBUG_LOG_CONFIG	0xbe
+#define EV_DEBUG_MESG		0x1d003	/* WMI_DEBUG_MESG_EVENTID */
+#define CMD_PDEV_SET_REGDOMAIN	0x4001
+#define CMD_PDEV_SET_HW_MODE	0x401e	/* guacamole: qcacld/ath11k WMI_PDEV_SET_HW_MODE_CMDID */
+#define TAG_PDEV_SET_HW_MODE	0x203
 #define TAG_SERVICE_AVAILABLE	0x22f
 #define ABI_VER0		0x01000000u
 #define ABI_VER1		53
@@ -544,6 +559,10 @@ struct wmi_mem_req { uint32_t req_id, unit_size, num_unit_info, num_units; };
 static uint32_t wmi_svc_map[32], wmi_svc_ext[4], wmi_nreq;
 static struct wmi_mem_req wmi_req[MAX_MEM_REQS];
 static int wmi_init_sent, wmi_ready, wmi_seen_bmap, wmi_seen_reqs;
+static uint64_t svc_ready_ms;		/* guacamole: SERVICE_READY seen, INIT waits for SERVICE_READY_EXT */
+static uint32_t wmi_eeprom_rd;		/* guacamole: hal_reg_capabilities.eeprom_rd (from the board file) */
+static uint64_t fwlog_until;		/* guacamole: print firmware log records until this link_ms() */
+static uint32_t fwlog_records, fwlog_shown;
 static uint8_t wmi_mac[6];
 
 /* ath10k WMI_SERVICE_IS_ENABLED: 4 service bits per 32-bit word (sizeof(u32)) */
@@ -593,6 +612,11 @@ static void wmi_svc_ready(const uint8_t *p, uint32_t len)
 			memcpy(&a0, v + 4, 4);
 			memcpy(&rf, v + 36, 4);
 			LOG("wmi: fw %08x abi %08x rf chains %u", fw, a0, rf);
+		} else if (tag == TAG_HAL_REG_CAP && l >= 36) {
+			uint32_t r[9];
+			memcpy(r, v, sizeof(r));
+			wmi_eeprom_rd = r[0];
+			LOG("wmi: eeprom rd %#x ext %#x, 2 GHz %u-%u, 5 GHz %u-%u", r[0], r[1], r[5], r[6], r[7], r[8]);
 		} else if (tag == TAG_ARRAY_UINT32 && !wmi_seen_bmap) {
 			wmi_seen_bmap = 1;
 			memcpy(wmi_svc_map, v, MIN((uint32_t)l, (uint32_t)sizeof(wmi_svc_map)));
@@ -657,8 +681,8 @@ static void wmi_send_init(void)
 	rc[4] = 2;					/* peer keys */
 	rc[5] = NUM_PEERS * 2;				/* tids */
 	rc[6] = 16;					/* ast skid limit */
-	rc[7] = 0x7;					/* tx chain mask */
-	rc[8] = 0x7;					/* rx chain mask */
+	rc[7] = 0x3;					/* tx chain mask (guacamole: SERVICE_READY_EXT says 0x3; ath10k 0x7) */
+	rc[8] = 0x3;					/* rx chain mask */
 	rc[9] = 0x64; rc[10] = 0x64; rc[11] = 0x64; rc[12] = 0x28;
 	rc[13] = 1;					/* rx decap: native wifi */
 	rc[14] = 4;					/* scan max pending */
@@ -726,6 +750,43 @@ static int scan_started, scanning;
 static uint64_t next_scan_ms;
 static int scan_asked;
 
+/*
+ * guacamole: the regulatory domain, as ath10k_regd_update() sends it after the channel list
+ * (Linux mac.c; wmi-tlv.c ath10k_wmi_tlv_op_gen_pdev_set_rd). Without it this firmware
+ * (WLAN.HL.3.2.0.c2) answers every VDEV_START with status -1 (phone runs wifi2, wifi3); flame's
+ * c9 did not need it. The pair comes from the board file's eeprom_rd like ath/regd.c does it:
+ * 0x8000 | country -> that country's regdomain pair (regd_common.h); a plain regdomain as is.
+ */
+static void pdev_set_regdomain(void)
+{
+	uint32_t rd = 0x3a, ctl2 = 0x10, ctl5 = 0x10;	/* FCC3_FCCA, CTL_FCC: the US (the b0a board file) */
+	if (wmi_eeprom_rd == (0x8000 | 156)) {		/* CN: APL1_WORLD, CTL_FCC/CTL_ETSI */
+		rd = 0x52;
+		ctl5 = 0x30;
+	} else if (wmi_eeprom_rd && !(wmi_eeprom_rd & 0x8000)) {
+		rd = wmi_eeprom_rd;
+	}
+	uint8_t m[4 + 24] = { 0 }, *c = put_tlv(m, TAG_PDEV_SET_REGDOMAIN, 24);
+	c = put32(c, 0);				/* pdev */
+	c = put32(c, rd);
+	c = put32(c, rd);
+	c = put32(c, rd);
+	c = put32(c, ctl2);
+	put32(c, ctl5);
+	int r = wmi_send(CMD_PDEV_SET_REGDOMAIN, m, sizeof(m));
+	LOG("regdomain: eeprom %#x -> rd %#x ctl %#x/%#x %s", wmi_eeprom_rd, rd, ctl2, ctl5, r ? "FAILED" : "sent");
+}
+
+/* guacamole: pdev and vdev parameters (wmi-tlv: {pdev or vdev, param, value}) */
+static int w_set_param(uint32_t cmd, uint16_t tag, uint32_t id, uint32_t value)
+{
+	uint8_t m[4 + 12], *c = put_tlv(m, tag, 12);
+	c = put32(c, 0);
+	c = put32(c, id);
+	put32(c, value);
+	return wmi_send(cmd, m, sizeof(m));
+}
+
 static int scan_send_start(void)
 {
 	static uint8_t m[512];
@@ -777,7 +838,16 @@ static void scan_start(void)
 	p = put_tlv(p, TAG_ARRAY_STRUCT, NFREQ * (4 + 24));
 	for (uint32_t i = 0; i < NFREQ; i++) {
 		uint32_t mode = scan_freqs[i] < 4000 ? 1 : 0;
-		uint32_t flags = mode | (1u << 7) | (1u << 11) | (scan_freqs[i] < 4000 ? 0 : (1u << 12));
+		/*
+		 * guacamole: passive (bit 7) only where the firmware's own rules (REG_CHAN_LIST_CC, US)
+		 * say DFS: 5250-5730 MHz, also flagged DFS (bit 10), and 2.4 GHz 12-13. Flame marked every
+		 * channel passive; this firmware then never started a vdev to join (wifi2-wifi12). The
+		 * scan stays passive by its own flags.
+		 */
+		int dfs = scan_freqs[i] > 5250 && scan_freqs[i] < 5730;
+		int passive = dfs || scan_freqs[i] > 2462 && scan_freqs[i] < 4000;
+		uint32_t flags = mode | (passive ? 1u << 7 : 0) | (dfs ? 1u << 10 : 0) | (1u << 11) |
+		    (scan_freqs[i] < 4000 ? 0 : (1u << 12));
 		c = put_tlv(p, TAG_CHANNEL, 24);
 		c = put32(c, scan_freqs[i]);
 		c = put32(c, scan_freqs[i]);
@@ -787,13 +857,64 @@ static void scan_start(void)
 		p = put32(c, 40u << 8);
 	}
 	int a = wmi_send(CMD_SCAN_CHAN_LIST, m, (uint32_t)(p - m));
-	uint8_t v[4 + 20] = { 0 };
-	c = put_tlv(v, TAG_VDEV_CREATE_CMD, 20);
+	/* guacamole: no pdev_set_regdomain(): this firmware keeps its own (REG_CHAN_LIST_CC), and
+	 * qcacld does not send the legacy regdomain to such firmware */
+	if (getenv("WLAND_SET_REGDOMAIN"))
+		pdev_set_regdomain();
+	/*
+	 * guacamole: ath10k_start's pdev setup (Linux mac.c; wmi-tlv.h pdev params), which flame's wland
+	 * skipped: above all the pdev chain masks, narrowed from INIT's 0x7 to the firmware's 2 chains
+	 * (ath10k: (1 << num_rf_chains) - 1). ios-sunfish (Yofuness, MIT) sends the same set before its
+	 * working joins. VDEV_START answered -1 with chain mask 0 without them (wifi2-wifi14).
+	 */
+	static const uint32_t pdev[][2] = {
+		{ 0x01, 0x3 },				/* TX_CHAIN_MASK */
+		{ 0x02, 0x3 },				/* RX_CHAIN_MASK */
+		{ 0x22, 1 },				/* PMF_QOS */
+		{ 0x0a, 1 },				/* DYNAMIC_BW */
+		{ 0x2c, 1 },				/* IDLE_PS_CONFIG */
+		{ 0x23, 0 },				/* ARP_AC_OVERRIDE */
+		{ 0x25, 1 },				/* ANI_ENABLE */
+	};
+	int pe = 0;
+	for (uint32_t i = 0; i < sizeof(pdev) / sizeof(pdev[0]); i++)
+		pe |= w_set_param(CMD_PDEV_SET_PARAM, TAG_PDEV_SET_PARAM, pdev[i][0], pdev[i][1]);
+	LOG("pdev: chain masks 0x3, pmf/dynamic bw/idle ps/arp ac/ani %s", pe ? "FAILED" : "sent");
+	/*
+	 * guacamole: with num_cfg_txrx_streams and one vdev_txrx_streams per band (2 GHz = 0,
+	 * 5 GHz = 1), as ath11k_wmi_vdev_create and qcacld send them: without them this firmware
+	 * answered every VDEV_START with status -1 and chain mask 0 (phone runs wifi2-wifi6).
+	 */
+	uint8_t v[4 + 28 + 4 + 2 * (4 + 12)] = { 0 };
+	c = put_tlv(v, TAG_VDEV_CREATE_CMD, 28);
 	c = put32(c, 0);				/* vdev 0 */
 	c = put32(c, 2);				/* station */
 	c = put32(c, 0);
 	memcpy(c, radio_mac, 6);
+	c = put32(c + 8, 2);				/* num_cfg_txrx_streams */
+	/*
+	 * guacamole: pdev_id (qcacld wmi_vdev_create_cmd_fixed_param). We leave the resource config's
+	 * use_pdev_id at 0, so the firmware reads it as a MAC id: MAC 0 (1 did not help in wifi11).
+	 */
+	c = put32(c, 0);
+	c = put_tlv(c, TAG_ARRAY_STRUCT, 2 * (4 + 12));
+	for (uint32_t band = 0; band < 2; band++) {
+		c = put_tlv(c, TAG_VDEV_TXRX_STREAMS, 12);
+		c = put32(c, band);
+		c = put32(c, 2);			/* tx streams: 2 rf chains */
+		c = put32(c, 2);			/* rx streams */
+	}
 	int b = wmi_send(CMD_VDEV_CREATE, v, sizeof(v));
+	/*
+	 * guacamole: what ath10k_add_interface and ath10k_mac_txpower_setup set next: the vdev's
+	 * spatial streams (VDEV_PARAM_NSS 0x22, from the 2-chain mask) and the tx power limits
+	 * (PDEV_PARAM_TXPOWER_LIMIT2G/5G 3/4, half dBm: 20 dBm). VDEV_START still answered -1 with
+	 * chain mask 0 without them (phone runs wifi2-wifi8).
+	 */
+	int n = w_set_param(CMD_VDEV_SET_PARAM, TAG_VDEV_SET_PARAM, 0x22, 2);
+	int t2 = w_set_param(CMD_PDEV_SET_PARAM, TAG_PDEV_SET_PARAM, 3, 40);
+	int t5 = w_set_param(CMD_PDEV_SET_PARAM, TAG_PDEV_SET_PARAM, 4, 40);
+	LOG("vdev: nss 2 %s, tx power limits %s/%s", n ? "FAILED" : "sent", t2 ? "FAILED" : "sent", t5 ? "FAILED" : "sent");
 	scanning = !scan_send_start();
 	LOG("scan: channel list (%u) %s, vdev %s, passive scan %s", NFREQ, a ? "FAILED" : "ok", b ? "FAILED" : "ok",
 	    scanning ? "requested" : "FAILED");
@@ -1332,10 +1453,15 @@ static int w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim)
 	p = put32(p, bcn);
 	p = put32(p, dtim);
 	p = put32(p, 0);
-	p += 36 + 16;					/* ssid (empty for a station), tx rate/power, noa, hw ack */
+	/* guacamole: the AP's SSID, as qcacld's wma_vdev_start fills it for a station too (ath10k: AP only) */
+	put32(p, s_ssid_len);
+	memcpy(p + 4, s_ssid, s_ssid_len);
+	p += 36 + 16;					/* ssid, tx rate/power, noa, hw ack */
 	p = w_channel(p, freq);
-	put_tlv(p, TAG_ARRAY_STRUCT, 0);
-	return wmi_send(CMD_VDEV_START, m, sizeof(m));
+	p = put_tlv(p, TAG_ARRAY_STRUCT, 0);
+	LOG("join: vdev start; firmware log so far: %u records", fwlog_records);
+	fwlog_until = link_ms() + 10000;	/* the firmware flushes its log buffer when full */
+	return wmi_send(CMD_VDEV_START, m, (uint32_t)(p - m));
 }
 
 static int w_vdev_simple(uint32_t cmd, uint16_t tag)
@@ -1548,8 +1674,7 @@ static void w_teardown(void)
 	if (s_state >= S_START) {
 		if (s_state >= S_4WAY)
 			w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
-		if (s_state >= S_AUTH)
-			w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, 0);
+		w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, 0);	/* created before VDEV_START */
 		w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
 	}
 	if (s_state == S_UP)
@@ -1616,6 +1741,29 @@ static void w_join_begin(void)
 	LOG("join: '%.*s' %02x:%02x:%02x:**:**:** %u MHz %d dBm %s", (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
 	    s_bssid[2], s_freq, bss[best].rssi, s_rsn ? "WPA2" : "open");
 	w_ps_off();
+	/*
+	 * guacamole: qcacld creates a peer with the vdev's own MAC for a station vdev before it is
+	 * started (wma_vdev_self_peer_create, mlme_vdev_uses_self_peer: STA); ath10k does not. wifi22/23:
+	 * this firmware turns VDEV_START down straight after receiving it, with no vdev module record.
+	 */
+	static int self_peer;
+	if (!self_peer) {
+		uint8_t m[4 + 16] = { 0 }, *p = put_tlv(m, TAG_PEER_CREATE, 16);
+		p = put32(p, 0);
+		p = put_mac(p, radio_mac);
+		put32(p, 0);				/* WMI_PEER_TYPE_DEFAULT */
+		self_peer = 1;
+		LOG("join: self peer %02x:%02x:%02x:%02x:%02x:%02x %s", radio_mac[0], radio_mac[1], radio_mac[2],
+		    radio_mac[3], radio_mac[4], radio_mac[5], wmi_send(CMD_PEER_CREATE, m, sizeof(m)) ? "FAILED" : "created");
+	}
+	/*
+	 * guacamole: the AP's peer before VDEV_START. This firmware's VDEV_START handler (wlanmdsp.mbn
+	 * 0xb0039f88, from WMI table entry 0x5003) sends VDEV_START_RESP status -1 at once, without a
+	 * log record, when the vdev is AP/STA and its word at +0xc is still 0 (0xb0039fd8..0xb0039ff0 ->
+	 * 0xb0039f18): the BSS peer, which qcacld creates before VDEV_START (connection manager:
+	 * bss peer create, then vdev start); ath10k creates it after.
+	 */
+	LOG("join: bss peer %s before vdev start", w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, 1) ? "FAILED" : "created");
 	if (w_vdev_start(s_freq, bcn, dtim)) {
 		w_join_end(EIO);
 		return;
@@ -1682,6 +1830,12 @@ static void sta_wmi_event(uint32_t id, const uint8_t *t, uint32_t len)
 	if (len < 4u + l)
 		return;
 	memcpy(v, t + 4, MIN((uint32_t)l, (uint32_t)sizeof(v)));
+	if (id == EV_VDEV_START_RESP) {			/* guacamole: the raw event, for the status -1 runs */
+		char hex[3 * 48 + 1] = "";
+		for (uint32_t i = 0; i < len && i < 48; i++)
+			snprintf(hex + 3 * i, 4, " %02x", t[i]);
+		LOG("join: vdev start resp (%u bytes):%s", len, hex);
+	}
 	if (id == EV_VDEV_START_RESP && l >= 16) {	/* {vdev, req, type, status} */
 		s_start_status = (int32_t)v[3];
 		s_start_resp = 1;
@@ -1854,8 +2008,7 @@ static void sta_poll(void)
 			}
 			s_state = S_AUTH;
 			s_tries = 1;
-			w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, 1);
-			w_send_auth();
+			w_send_auth();			/* the peer exists already (w_join_begin) */
 			s_deadline = now + 400;
 		} else if (now > s_deadline) {
 			w_join_end(ETIMEDOUT);
@@ -1918,6 +2071,43 @@ int radio_join_result(void)	/* -1 while it runs, 0 joined, else an errno */
 
 /* ---------------------------------------------------------------- WMI events */
 
+/*
+ * guacamole: WMI_DEBUG_MESG_EVENTID: one byte array of {dropped count} then records
+ * {timestamp, header, args[]}; header (qcacld dbglog.h): bits 0-9 message id, 10-17 module,
+ * 18-25 vdev, 26-31 number of args. Printed in full around a join (fwlog_until), else counted.
+ */
+static void fwlog_event(const uint8_t *t, uint32_t len)
+{
+	uint16_t l, tag;
+	if (len < 8)
+		return;
+	memcpy(&l, t, 2);
+	memcpy(&tag, t + 2, 2);
+	if (tag != TAG_ARRAY_BYTE || 4u + l > len || l < 4)
+		return;
+	const uint8_t *b = t + 8;
+	uint32_t n = (l - 4) / 4, w[16];
+	int show = (link_ms() < fwlog_until || fwlog_shown < 40) && fwlog_shown < 1500;
+	for (uint32_t i = 0; i + 2 <= n;) {
+		uint32_t ts, h;
+		memcpy(&ts, b + 4 * i, 4);
+		memcpy(&h, b + 4 * i + 4, 4);
+		uint32_t na = h >> 26;
+		if (na > 9 || i + 2 + na > n)
+			break;
+		memcpy(w, b + 4 * (i + 2), 4 * na);
+		fwlog_records++;
+		if (show) {
+			char a[9 * 11 + 1] = "";
+			for (uint32_t k = 0; k < na; k++)
+				snprintf(a + 11 * k, 12, " %#010x", w[k]);
+			LOG("fw: [%u] mod %u id %u vdev %u:%s", ts, (h >> 10) & 0xff, h & 0x3ff, (h >> 18) & 0xff, a);
+			fwlog_shown++;
+		}
+		i += 2 + na;
+	}
+}
+
 static void wmi_rx(const uint8_t *d, uint32_t len)
 {
 	uint32_t id;
@@ -1936,8 +2126,14 @@ static void wmi_rx(const uint8_t *d, uint32_t len)
 	case WMI_EV_SERVICE_READY:
 		LOG("wmi: SERVICE_READY, %u bytes", len);
 		wmi_svc_ready(d + 4, len - 4);
-		if (!wmi_init_sent)
-			wmi_send_init();
+		/*
+		 * guacamole: INIT waits for SERVICE_READY_EXT (0x4009, the MAC/PHY and hw mode tables), as
+		 * qcacld's wma_rx_service_ready_event does when the firmware has the EXT_MSG service, and as
+		 * Bergamota's working WCN3990 join (INIT after 0x4009). Sent right away, INIT went out before
+		 * 0x4009 and every VDEV_START came back -1 with chain mask 0 (wifi2-wifi17). 1 s at most.
+		 */
+		if (!wmi_init_sent && !svc_ready_ms)
+			svc_ready_ms = link_ms();
 		break;
 	case WMI_EV_READY:
 		for (uint32_t o = 4; o + 4 <= len;) {
@@ -1948,14 +2144,54 @@ static void wmi_rx(const uint8_t *d, uint32_t len)
 				break;
 			if (tag == TAG_READY_EVENT && l >= 24 + 8 + 4) {
 				memcpy(wmi_mac, d + o + 4 + 24, 6);
+				memcpy(radio_mac, wmi_mac, 6);
 				wmi_ready = 1;
 			}
 			o += 4 + l;
 		}
 		LOG("*** WMI READY (fw MAC %02x:%02x:%02x:%02x:%02x:%02x) ***", wmi_mac[0], wmi_mac[1], wmi_mac[2],
 		    wmi_mac[3], wmi_mac[4], wmi_mac[5]);
-		if (wmi_ready)
+		if (wmi_ready) {
+			/*
+			 * guacamole: this firmware's SERVICE_READY_EXT lists two hardware modes (0 single
+			 * MAC for both bands, 1 DBS) and no mode is in force until the host picks one, as
+			 * Android's policy manager does at start (ath11k wmi.h layout). Without it every
+			 * VDEV_START came back -1 with chain mask 0 (phone runs wifi2-wifi5).
+			 */
+			uint8_t m[4 + 12 + 4], *c = put_tlv(m, TAG_PDEV_SET_HW_MODE, 12);
+			c = put32(c, 0);			/* pdev: the SoC */
+			c = put32(c, 0);			/* hw_mode_index: single */
+			c = put32(c, 0);			/* num_band_to_mac */
+			put_tlv(c, TAG_ARRAY_STRUCT, 0);
+			LOG("wmi: set hw mode 0 %s", wmi_send(CMD_PDEV_SET_HW_MODE, m, sizeof(m)) ? "FAILED" : "sent");
+			/*
+			 * guacamole: the firmware's own log (qcacld wmi_unified.h WMI_DBGLOG_CFG_CMDID): log
+			 * level INFO (1) for every module (id 0xffff), then the fixed 16-word module bitmap.
+			 * Records come back in WMI_DEBUG_MESG_EVENTID (fwlog_event).
+			 */
+			/*
+			 * As qcacld's dbglog_set_log_lvl + dbglog_report_enable: level INFO for module ALL
+			 * (WMI_DBGLOG_SET_MODULE_ID: low 16 bits, WMI_DBGLOG_SET_LOG_LEVEL: high 16; the
+			 * first try had them swapped), every vdev, every module in the bitmap.
+			 */
+			static const uint32_t dbg[3][2] = {
+				{ 1, (1u << 16) | 0xffff },	/* LOG_LEVEL: INFO, module ALL */
+				{ 4, 0xffff },			/* VDEV_ENABLE_BITMAP */
+				{ 5, 0 },			/* MOD_ENABLE_BITMAP (level 0), bitmap below */
+			};
+			int ge = 0;
+			for (int k = 0; k < 3; k++) {
+				uint8_t g[4 + 8 + 4 + 64] = { 0 }, *q = put_tlv(g, TAG_DEBUG_LOG_CONFIG, 8);
+				q = put32(q, dbg[k][0]);
+				q = put32(q, dbg[k][1]);
+				q = put_tlv(q, TAG_ARRAY_UINT32, 64);
+				if (dbg[k][0] == 5)
+					memset(q, 0xff, 64);
+				ge |= wmi_send(CMD_DBGLOG_CFG, g, sizeof(g));
+			}
+			LOG("wmi: firmware log %s", ge ? "FAILED" : "requested (level, vdev and module bitmaps)");
 			htt_start();				/* the host rx ring first, then the scan */
+		}
 		break;
 	case WMI_EV_SCAN:
 		scan_event(d + 4, len - 4);
@@ -1963,13 +2199,93 @@ static void wmi_rx(const uint8_t *d, uint32_t len)
 	case WMI_EV_MGMT_RX:
 		scan_mgmt_rx(d + 4, len - 4);
 		break;
+	case EV_DEBUG_MESG:
+		fwlog_event(d + 4, len - 4);
+		break;
 	case EV_VDEV_START_RESP:
 	case EV_PEER_STA_KICKOUT:
 	case EV_ROAM:
 		sta_wmi_event(id, d + 4, len - 4);
 		break;
-	default:
+	default: {
+		/* guacamole: which other events this firmware sends (the first time each id comes) */
+		static uint32_t seen[32];
+		uint32_t i;
+		/*
+		 * guacamole: WMI_DIAG_EVENTID, the firmware's own log once WLFW INI enablefwlog=1 is sent
+		 * (wifi19). Records (wifi20, 19448 of them, all in this shape): u32 0x07000000, u32 firmware
+		 * timestamp, u8 payload length, u8 level (0xf8-0xfd), u16 message id, payload. Printed only in
+		 * the 10 s after the first VDEV_START (the firmware flushes its buffer late), without the three
+		 * ids that made up 63% of wifi20 (periodic): printing every event stalled wland for 2 minutes.
+		 */
+		/*
+		 * wifi21: within the 10 s after VDEV_START only older buffers came (no "event 0x5001 sent").
+		 * Record 6027 is "WMI event sent" (payload: the event id), so the firmware's handling of
+		 * VDEV_START sits just before the 6027 carrying 0x5001 (VDEV_START_RESP): keep the last
+		 * 80 records (the periodic three left out) and print them and the 20 after, 3 times.
+		 */
+		static struct { uint32_t ts, h, w[8]; } ring[80];
+		static unsigned ring_n, diag_trig, diag_after, vdev_trig_open;
+		if (id == 0x1d011 && diag_trig < 3) {
+			const uint8_t *b = d + 8;
+			uint32_t n = len - 8, o = 0;
+			while (o + 4 <= n && memcmp(b + o, "\0\0\0\7", 4))
+				o += 4;
+			while (o + 12 <= n && !memcmp(b + o, "\0\0\0\7", 4)) {
+				uint32_t ts, h, w[8] = { 0 };
+				memcpy(&ts, b + o + 4, 4);
+				memcpy(&h, b + o + 8, 4);
+				uint32_t pl = h & 0xff, mid = h >> 16;
+				if (o + 12 + pl > n)
+					break;
+				memcpy(w, b + o + 12, pl < 32 ? pl : 32);
+				o += 12 + pl;
+				if (mid == 7289 || mid == 7290 || mid == 5956)
+					continue;
+				if (diag_after) {
+					diag_after--;
+					LOG("fw   +  %08x L%x id %u: %x %x %x %x %x %x %x %x", ts, (h >> 8) & 0xff, mid,
+					    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+					if (!diag_after && vdev_trig_open)
+						diag_trig++, vdev_trig_open = 0;
+					continue;
+				}
+				unsigned r = ring_n++ % 80;
+				ring[r].ts = ts, ring[r].h = h;
+				memcpy(ring[r].w, w, sizeof(w));
+				if (mid == 6027 && w[0] == 0x5001 && s_start_resp && s_start_status) {
+					LOG("fw: VDEV_START_RESP sent: the %u records before it", ring_n < 80 ? ring_n : 80);
+					for (unsigned k = ring_n < 80 ? 0 : ring_n - 80; k < ring_n; k++) {
+						unsigned q = k % 80;
+						LOG("fw  %3d %08x L%x id %u: %x %x %x %x %x %x %x %x", (int)k - (int)ring_n + 1,
+						    ring[q].ts, (ring[q].h >> 8) & 0xff, ring[q].h >> 16, ring[q].w[0], ring[q].w[1],
+						    ring[q].w[2], ring[q].w[3], ring[q].w[4], ring[q].w[5], ring[q].w[6], ring[q].w[7]);
+					}
+					diag_after = 20;
+					vdev_trig_open = 1;
+				}
+			}
+		}
+		if (id == 0x4009 && svc_ready_ms && !wmi_init_sent) {
+			LOG("wmi: SERVICE_READY_EXT %u ms after SERVICE_READY: INIT now", (unsigned)(link_ms() - svc_ready_ms));
+			wmi_send_init();
+		}
+		for (i = 0; i < 32 && seen[i] && seen[i] != id; i++)
+			;
+		if (i < 32 && !seen[i]) {
+			seen[i] = id;
+			LOG("wmi: event %#x (%u bytes)", id, len);
+			/* SERVICE_READY_EXT, SET_HW_MODE_RESP/HW_MODE_TRANSITION, REG_CHAN_LIST_CC (qcacld ids): the whole event */
+			if (id == 0x4009 || id == 0x4010 || id == 0x4011 || id == 0x3a001)
+				for (uint32_t o = 4; o < len && o < 4 + 512; o += 32) {
+					char hex[3 * 32 + 1] = "";
+					for (uint32_t j = 0; j < 32 && o + j < len; j++)
+						snprintf(hex + 3 * j, 4, " %02x", d[o + j]);
+					LOG("wmi: %#x +%03x:%s", id, o - 4, hex);
+				}
+		}
 		break;
+	}
 	}
 }
 
@@ -1994,6 +2310,10 @@ void radio_poll(void)
 	last = now;
 	ce_poll();
 	now = link_ms();				/* what ce_poll started is stamped after the first now */
+	if (svc_ready_ms && !wmi_init_sent && now > svc_ready_ms + 1000) {
+		LOG("wmi: no SERVICE_READY_EXT in 1 s, INIT anyway");
+		wmi_send_init();
+	}
 	if (htt_state == 1 && now > htt_req_ms + 2000) {
 		LOG("htt: no VERSION_CONF in 2 s, configuring anyway");
 		htt_configure("timeout");

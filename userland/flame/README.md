@@ -1,12 +1,15 @@
 # Tools from ios-flame
 
-`lsreg.m`, `oslog.m` and their entitlement plists are copied unchanged from
+`lsreg.m`, `oslog.m`, `netsvc.m`, `nettest.m` and their entitlement plists are copied unchanged from
 [NWylynko/ios-flame](https://github.com/NWylynko/ios-flame) `phone/tools`
 (commit 745c434), iOS 16 on the Pixel 4 (SM8150, like guacamole).
 
 - `lsreg`: LaunchServices registration (`-r` rebuilds the app databases, `-l` lists
   apps, `-p` registers one .appex). Signed with com.apple.migrationpluginwrapper's
   entitlements (key names only).
+- `netsvc`: `netsvc up IF ADDR MASK ROUTER DNS [DNS2]` / `down IF` / `show IF`: a
+  SystemConfiguration network service for an interface (wland's utun after DHCP).
+- `nettest`: DNS, then TCP, then HTTPS.
 - `oslog`: streams the unified log (`oslog [-t SECS] [-l] [PROCESS...]`), which iOS has
   no command for.
 

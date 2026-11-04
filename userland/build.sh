@@ -33,6 +33,9 @@ build lsreg flame/lsreg.m -fobjc-arc -framework Foundation -framework MobileCore
 codesign -f -s - --entitlements flame/lsreg-ents.plist out/lsreg
 build oslog flame/oslog.m -fobjc-arc -framework Foundation
 codesign -f -s - --entitlements flame/oslog-ents.plist out/oslog
+build netsvc flame/netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
+codesign -f -s - --entitlements flame/netsvc-ents.plist out/netsvc
+build nettest flame/nettest.m -fobjc-arc -framework Foundation
 # G3: needs userland/mesa/mk-mesa.sh first (libOSMesa.8.dylib + headers)
 MESA=mesa/build
 if [ -f $MESA/out/libOSMesa.8.dylib ]; then

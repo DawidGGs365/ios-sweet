@@ -29,10 +29,19 @@
 #define MAC_ADDR	0x33
 #define HOST_CAP	0x34
 #define FW_INIT_DONE_IND 0x38
+#define INI		0x2f	/* guacamole: icnss wlfw_ini_send_sync_msg (enablefwlog) */
+#define DYN_FEATURE_MASK 0x3b	/* guacamole: icnss wlfw_dynamic_feature_mask_send_sync_msg */
 
 #define CLIENT_ID	0x4b4e454c	/* ath10k's */
 #define MSA_PA		0x8bc00000ull	/* pil_wlan_fw_region */
-#define MSA_SIZE	0x100000u	/* qcom,wlan-msa-memory */
+/*
+ * guacamole: the whole pil_wlan_fw_region (live DT: 0x8bc00000 + 0x180000). icnss (OnePlus
+ * drivers/soc/qcom/icnss.c) gives the firmware the size of qcom,wlan-msa-fixed-region when the node
+ * has one, and only falls back to qcom,wlan-msa-memory (0x100000, what flame used) without it. With
+ * 1 MB every VDEV_START came back -1 (wifi2-wifi13); ios-sunfish found the same (MSA 1 MB vs its 2 MB:
+ * the firmware heap's upper part was never assigned, vdev start failed).
+ */
+#define MSA_SIZE	0x180000u
 /* guacamole: the modem partition's board files, named as ath10k qmi.c picks them: bdwlan.b<board id> (hex), bdwlan.bin for board id 0xff */
 #define BDF_DIR		"/var/local/fw/modem"
 
@@ -179,7 +188,7 @@ static int bdf_download(const char *path, int file_id, int bdf_type, unsigned se
 		qmi_tlv(&q, 0x13, data, (uint16_t)(2 + chunk));
 		int end = off + chunk >= len;
 		qmi_tlv_u8(&q, 0x14, (uint8_t)end);
-		if (bdf_type >= 0)		/* downstream field after "end": 0 BIN, 1 ELF, 2 REGDB */
+		if (bdf_type >= 0)		/* downstream field after "end": 0 BIN, 1 ELF, 4 REGDB (cnss2) */
 			qmi_tlv_u8(&q, 0x15, (uint8_t)bdf_type);
 		int e = request(&q, &r, 5000);
 		if (e)
@@ -197,6 +206,14 @@ static int wlan_enable(void)
 {
 	struct qmi_buf q;
 	struct qmi_msg r;
+	/*
+	 * guacamole: as qcacld before wlan_enable (pld_set_fw_log_mode with gEnablefwlog=1 from the stock
+	 * WCNSS_qcom_cfg.ini): the firmware sends its own log to the host only after this. Without it
+	 * WMI DBGLOG_CFG gave no record (wifi9-wifi18).
+	 */
+	qmi_start(&q, QMI_REQUEST, 0, INI);
+	qmi_tlv_u8(&q, 0x10, 1);		/* enablefwlog */
+	printf("wlfw: ini enablefwlog=1 -> %d\n", request(&q, &r, 5000));
 	qmi_start(&q, QMI_REQUEST, 0, WLAN_CFG);
 	uint8_t b[1 + 24 * 21];
 	b[0] = 12;
@@ -296,6 +313,8 @@ int wlfw_start(void)
 		memcpy(&wlfw.chip_id, p, 4);
 		memcpy(&wlfw.chip_family, p + 4, 4);
 	}
+	/* icnss_qmi.c wlfw_cap_send_sync_msg: no board_info TLV means board id 0xff (this firmware sends none) */
+	wlfw.board_id = 0xff;
 	if ((p = qmi_get(&r, 0x11, &l)) && l >= 4)
 		memcpy(&wlfw.board_id, p, 4);
 	if ((p = qmi_get(&r, 0x12, &l)) && l >= 4)
@@ -306,20 +325,53 @@ int wlfw_start(void)
 		memcpy(wlfw.build_id, p, l < sizeof(wlfw.build_id) - 1 ? l : sizeof(wlfw.build_id) - 1);
 	printf("wlfw: chip %#x family %#x board %#x soc %#x fw %#x \"%s\"\n", wlfw.chip_id, wlfw.chip_family,
 	       wlfw.board_id, wlfw.soc_id, wlfw.fw_version, wlfw.build_id);
+	/* icnss_driver_event_server_arrive sends this right after CAP: ICNSS_DEFAULT_FEATURE_MASK 0x1 */
+	qmi_start(&q, QMI_REQUEST, 0, DYN_FEATURE_MASK);
+	uint8_t fm[8] = { 1 };
+	qmi_tlv(&q, 0x10, fm, 8);
+	printf("wlfw: dynamic feature mask 0x1 -> %d\n", request(&q, &r, 5000));
 
+	/*
+	 * guacamole: OnePlus's own driver (icnss, LineageOS android_kernel_oneplus_sm8150
+	 * drivers/soc/qcom/icnss.c) sends no board data, MAC address or cal report: after CAP it only
+	 * waits for FW READY, the firmware picks its board file itself. ath10k (and flame) send all
+	 * three. Waiting like icnss (WLFW_ICNSS_WAIT=1) gives no FW READY in 10 s on this firmware
+	 * and no TFTP read of a board file (wifi12): somebody on Android sends it (cnss-daemon?), so
+	 * the board data goes from here as before.
+	 */
+	if (!fw_ready && getenv("WLFW_ICNSS_WAIT")) {
+		for (int t = 0; t < 10000 && !fw_ready; t++)
+			link_poll(1);
+		printf("wlfw: icnss order: %s\n", fw_ready ? "FW READY without host board data" : "no FW READY in 10 s, sending board data");
+	}
 	if (!fw_ready) {
 		/* ath10k waits for the MSA ready indication before the board data */
 		for (int t = 0; t < 5000 && !msa_ready; t++)
 			link_poll(1);
-		/* which request shape this firmware takes is not known yet: try them in turn */
-		char bdf_board[64];
+		/*
+		 * guacamole: as the stock cnss-daemon (vendor/bin/cnss-daemon, wlfw_send_bdf_download_req):
+		 * after CAP it sends regdb.bin (bdf_type 4, a failure is not fatal), then the board file
+		 * (bdf_type 0). With board id 0xff OnePlus picks the file by vendor.boot.prj_version /
+		 * hw_version / rf_version and persist.vendor.oem.wifi.chain; this phone has 1 / 21 / 4
+		 * (Europe) and chain 0: bdwlan.b0e. Our earlier b0a (US) and bdwlan.bin gave VDEV_START
+		 * status -1 (wifi2-wifi15). WLFW_BDF=<name> picks another file from BDF_DIR.
+		 */
+		char bdf_board[64], bdf_env[64];
 		if ((wlfw.board_id & 0xff) == 0xff)
-			snprintf(bdf_board, sizeof(bdf_board), BDF_DIR "/bdwlan.bin");
+			snprintf(bdf_board, sizeof(bdf_board), BDF_DIR "/bdwlan.b0e");
 		else
 			snprintf(bdf_board, sizeof(bdf_board), BDF_DIR "/bdwlan.b%02x", wlfw.board_id & 0xff);
+		const char *be = getenv("WLFW_BDF");		/* a name in BDF_DIR, or an absolute path */
+		snprintf(bdf_env, sizeof(bdf_env), be && be[0] == '/' ? "%s" : BDF_DIR "/%s", be ? be : "-");
+		if (access(BDF_DIR "/regdb.bin", R_OK) == 0)
+			printf("wlfw: regdb.bin (type 4) -> %d\n", bdf_download(BDF_DIR "/regdb.bin", 0, 4, 6144));
+		else
+			printf("wlfw: no regdb.bin, board file only\n");
 		const struct { const char *path; int file_id, type; unsigned seg; } v[] = {
-			{ bdf_board, 0, -1, 6144 },
-			{ BDF_DIR "/bdwlan.bin", 0, -1, 6144 },
+			{ bdf_env, 0, 0, 6144 },
+			{ bdf_board, 0, 0, 6144 },
+			{ "/private/var/tmp/bdwlan.b0e", 0, 0, 6144 },	/* a SWEETBOX copy (sweet-autorun sets no env) */
+			{ BDF_DIR "/bdwlan.bin", 0, 0, 6144 },
 		};
 		int ok = 0;
 		for (unsigned i = 0; i < sizeof(v) / sizeof(v[0]) && !ok; i++) {

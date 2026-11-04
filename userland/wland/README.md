@@ -26,8 +26,9 @@ Files on the phone (from your own phone's partitions; never in git):
 Taken from [NWylynko/ios-flame](https://github.com/NWylynko/ios-flame)
 `phone/wifi` (commit 745c434), which runs it on the Pixel 4: the
 same SM8150 and WCN3990. guacamole changes are marked `guacamole:` in the
-source (modem region size, board file names by board id as in Linux ath10k,
-MAC address, jetsam limit in `up`). ios-flame's CREDITS: `radio.c` is a
+source (modem region size, board id and board file as the stock cnss-daemon
+picks them, MAC address from WMI READY, the BSS peer before VDEV_START, the
+firmware log over WLFW INI, jetsam limit in `up`; docs/guacamole.md, Wi-Fi). ios-flame's CREDITS: `radio.c` is a
 userland port of ios-topaz's TopazModem; the protocol code follows Linux
 ath10k (ISC) and the Qualcomm SMEM, SMP2P, GLINK, QRTR and remoteproc
 drivers, and Bjorn Andersson's rmtfs, pd-mapper and tqftpserv.

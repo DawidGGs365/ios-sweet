@@ -11,7 +11,7 @@ void radio_stats(void);
 unsigned radio_scans(void);	/* passive scans completed */
 void radio_scan_now(void);	/* a scan as soon as it can, also while joined (a background scan) */
 void radio_rescan(unsigned ms);	/* another passive scan in MS (while idle: not joining, not joined) */
-extern const uint8_t radio_mac[6];
+extern uint8_t radio_mac[6];
 
 /* station: join SSID (passphrase, 64 hex digits = PMK, or "" for open); after the first scan */
 int radio_join(const char *ssid, const char *pass);

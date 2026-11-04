@@ -26,7 +26,7 @@ as coming from a device tree (DT) or Linux.
 | Stock removable apps (Calculator, Weather, Notes, ...) | installed from staged_system_apps (userland/sysapps, sweetcsoff=1 once) |
 | Photos, Settings > About, Wallet | work (0135 sandbox extensions; fairplayd job removed) |
 | Wallpaper picker, app extensions | work (0137 AMFI trust stand-in + ADT mac-address-*; once `lsreg -r`): all 10 poster providers |
-| Wi-Fi | modem boots from userland (0138 /dev/pmem, userland/wland from ios-flame), WLFW mission mode, WMI/HTT up, passive scans list networks (wifi1); join and Settings next |
+| Wi-Fi | works: WPA2-PSK join, DHCP, internet (wifi25: HTTPS 200 from apple.com); userland/wland from ios-flame over 0138 /dev/pmem; en0 + Apple80211 for wifid/Settings (0139, from ios-flame 0123) |
 | Audio, CPU frequency | not started |
 
 ## Workflow
@@ -139,6 +139,45 @@ Lessons:
   Fixed in 0120 with ptoa().
 - Grown L3 tables are separate pages: keep their kernel VA. Client VA from
   0x1100000 shares 2 MB slot 8 with the stage-7 block: reuse its L3.
+
+## Wi-Fi (WCN3990, firmware WLAN.HL.3.2.0.c2)
+
+userland/wland (from ios-flame, README there) does the whole bring-up: modem
+PAS boot, GLINK/QRTR, rmtfs/pd-mapper/TFTP, WLFW, then the radio over the copy
+engines (WMI-TLV, HTT). What this phone's firmware needed beyond Pixel 4's
+(each `guacamole:` in the source):
+
+- MSA region: the whole pil_wlan_fw_region (0x8bc00000 + 0x180000), as
+  icnss gives it (qcom,wlan-msa-fixed-region), not 1 MB.
+- WLFW CAP has no board_info TLV: board id 0xff (icnss). The board file is
+  then picked as the stock cnss-daemon does (OnePlus code, by
+  vendor.boot.prj_version / hw_version / rf_version and
+  persist.vendor.oem.wifi.chain; this phone 1 / 21 / 4 (Europe), chain 0):
+  `bdwlan.b0e`, sent with bdf_type 0. regdb.bin would go first (type 4);
+  the modem partition has none.
+- The MAC from WMI READY.
+- WLFW INI enablefwlog=1 (stock gEnablefwlog=1): only then does the
+  firmware send its log, as WMI_DIAG_EVENTID (0x1d011). Records: u32
+  0x07000000, u32 timestamp, u8 payload length, u8 0xf8|level, u16 id
+  (a source line number; ids repeat across files), payload. 6027 = "WMI
+  event sent" (payload: event id).
+- **The BSS peer before VDEV_START.** wifi2-wifi24: every VDEV_START came
+  back status -1, chain mask 0, at once, no log record. In wlanmdsp.mbn
+  (Hexagon; WMI table entry 0x5003 -> handler 0xb0039f88): for an AP/STA
+  vdev whose word at +0xc is 0 it goes straight to 0xb0039f18, which sends
+  VDEV_START_RESP with status 0xffffffff. qcacld creates the AP's peer
+  (PEER_CREATE with the BSSID) before VDEV_START; ath10k after. With the
+  peer first (wifi25): status 0, chain mask 3, auth, assoc, 4-way, DHCP.
+- The firmware keeps printf strings for some messages (`wlan_vdev.c:...`):
+  descriptors of {u32 format or hash, u32 module<<16 | line, u32 flags}.
+
+Settings: 0139 (ios-flame 0123: topaz 0900 + HackiOS) makes en0 and the
+Apple80211 interface for wifid over /dev/wlan; wland's bridge.c serves it
+(iOS then does DHCP on en0 itself; without /dev/wlan, or boot-arg
+sweetwifid=0, wland keeps its own utun + netsvc). 0139 also has AKS
+wrap/unwrap (keychain items, wifid's passwords) and drops IOKit's busy
+hold for an IOKit daemon that never reports (configd's InterfaceNamer and
+wifid waited for it).
 
 ## SWEETBOX file drop
 
