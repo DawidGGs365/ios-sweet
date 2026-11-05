@@ -1,0 +1,366 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-05 23:53:30.553475453 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-05 23:53:30.554413277 +0100
+@@ -15,6 +15,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <stdarg.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -167,6 +168,20 @@
+ 	hw.nbranch = 3;
+ }
+ 
++/* Last SWEET TOUCH line; the guacamole thread re-prints it on stop (GUI hides the console). */
++static char touch_last[224];
++
++static void touch_log(const char *fmt, ...) __printflike(1, 2);
++static void
++touch_log(const char *fmt, ...)
++{
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(touch_last, sizeof(touch_last), fmt, ap);
++	va_end(ap);
++	printf("%s", touch_last);
++}
++
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -219,6 +234,9 @@
+ 	touch_wr(st.gpio, off, cfg);
+ }
+ 
++/* SE DFS performance level used by SE_CLK_SEL (SM8150 XBL: 7.37 MHz at 0, 19.2 MHz XO at 2). */
++static unsigned touch_dfs_level;
++
+ static bool
+ touch_clocks(void)
+ {
+@@ -227,13 +245,28 @@
+ 	touch_wr(st.gcc, hw.vote, touch_rd(st.gcc, hw.vote) | hw.vote_mask);
+ 	uint32_t dfs = touch_rd(st.gcc, rcg + 0x14u);
+ 	uint32_t cfg = touch_rd(st.gcc, rcg + 4u);
+-	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	touch_log("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+ 	    touch_rd(st.gcc, hw.vote), touch_rd(st.gcc, rcg), cfg, dfs);
+ 	if (dfs & 1u) {
+-		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
+-		cfg = touch_rd(st.gcc, rcg + 0x1cu);
+-		if ((cfg & 0x371fu) != 1u) {
+-			printf("SWEET TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
++		/*
++		 * SE_CLK_SEL picks a DFS performance level. Do not alter tables:
++		 * find the XO parent, divider 1, no M/N level (19.2 MHz) the I2C
++		 * timings assume. Linux SE_PERF_DFSR(level) = 0x1c + 4 * level.
++		 */
++		bool found = false;
++		for (unsigned level = 0; level < 8; ++level) {
++			cfg = touch_rd(st.gcc, rcg + 0x1cu + 4u * level);
++			if ((cfg & 0x371fu) == 1u) {
++				touch_dfs_level = level;
++				found = true;
++				break;
++			}
++		}
++		touch_log("SWEET TOUCH: DFS levels %#x %#x %#x %#x; XO level %s %u\n",
++		    touch_rd(st.gcc, rcg + 0x1cu), touch_rd(st.gcc, rcg + 0x20u),
++		    touch_rd(st.gcc, rcg + 0x24u), touch_rd(st.gcc, rcg + 0x28u),
++		    found ? "=" : "missing", touch_dfs_level);
++		if (!found) {
+ 			return false;
+ 		}
+ 	} else {
+@@ -242,13 +275,13 @@
+ 		touch_wr(st.gcc, rcg + 4u, cfg);
+ 		touch_wr(st.gcc, rcg, touch_rd(st.gcc, rcg) | 1u);
+ 		if (!touch_wait_clear(st.gcc, rcg, 1u)) {
+-			printf("SWEET TOUCH: RCG update timeout\n");
++			touch_log("SWEET TOUCH: RCG update timeout\n");
+ 			return false;
+ 		}
+ 	}
+ 	for (unsigned i = 0; i < hw.nbranch; ++i) {
+ 		if (!touch_wait_clear(st.gcc, hw.branch[i], 1u << 31)) {
+-			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", hw.branch[i],
++			touch_log("SWEET TOUCH: GCC branch %#x halted (%#x)\n", hw.branch[i],
+ 			    touch_rd(st.gcc, hw.branch[i]));
+ 			return false;
+ 		}
+@@ -271,7 +304,7 @@
+ 	}
+ 	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
+ 		st.dead = true;
+-		printf("SWEET TOUCH: abort failed status=%#x irq=%#x; stopping\n",
++		touch_log("SWEET TOUCH: abort failed status=%#x irq=%#x; stopping\n",
+ 		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
+ 	}
+ 	/* Bound drain even if the hardware reports an impossible FIFO count. */
+@@ -281,7 +314,7 @@
+ 	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+ 	if (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
+ 		st.dead = true;
+-		printf("SWEET TOUCH: TX FIFO not empty after abort; stopping\n");
++		touch_log("SWEET TOUCH: TX FIFO not empty after abort; stopping\n");
+ 	}
+ }
+ 
+@@ -381,7 +414,7 @@
+ 	st.sent = st.got = 0;
+ 	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
+ 	if (st.probing) {
+-		printf("SWEET TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
++		touch_log("SWEET TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+ 		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+ 		    err, st.irq_last, st.irq_status, st.sent, st.got,
+ 		    touch_rd(st.se, SE_STATUS));
+@@ -417,7 +450,7 @@
+ {
+ 	memset(buf, 0xa5, 32);
+ 	int err = touch_read(0x5d, reg, true, buf, 32);
+-	printf("SWEET TOUCH: probe info reg=%#x len=32 err=%d irq=%#x seen=%#x\n",
++	touch_log("SWEET TOUCH: probe info reg=%#x len=32 err=%d irq=%#x seen=%#x\n",
+ 	    reg, err, st.irq_last, st.irq_status);
+ 	if (!err) {
+ 		for (unsigned off = 0; off < 32; off += 16) {
+@@ -425,7 +458,7 @@
+ 			for (unsigned j = 0; j < 16; ++j) {
+ 				(void)snprintf(line + j * 3u, 4, "%02x ", buf[off + j]);
+ 			}
+-			printf("SWEET TOUCH: probe raw %#x: %s\n", reg + off, line);
++			touch_log("SWEET TOUCH: probe raw %#x: %s\n", reg + off, line);
+ 		}
+ 	}
+ 	return err;
+@@ -577,17 +610,17 @@
+ {
+ 	uint32_t fw = touch_rd(st.se, SE_FW);
+ 	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
+-	printf("SWEET TOUCH: se@%#x fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
++	touch_log("SWEET TOUCH: se@%#x fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+ 	    hw.se_pa, fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, 0x908));
+ 	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		printf("SWEET TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
++		touch_log("SWEET TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
+ 		return false;
+ 	}
+ 	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+-		printf("SWEET TOUCH: SE7 already busy; probes skipped\n");
++		touch_log("SWEET TOUCH: SE7 already busy; probes skipped\n");
+ 		return false;
+ 	}
+ 	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+@@ -600,7 +633,7 @@
+ 	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+ 	touch_wr(st.se, 0x24, 0x7f);
+ 	touch_wr(st.se, 0x20, 1);
+-	touch_wr(st.se, SE_CLK_SEL, 0);
++	touch_wr(st.se, SE_CLK_SEL, touch_dfs_level);
+ 	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+ 	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+ 	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+@@ -613,18 +646,18 @@
+ 	touch_wr(st.se, 0x810, 0);
+ 	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
+ 	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
+-	printf("SWEET TOUCH: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
++	touch_log("SWEET TOUCH: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
+ 	    touch_rd(st.se, 0x260), touch_rd(st.se, 0x264),
+ 	    touch_rd(st.se, 0x284), touch_rd(st.se, 0x288), touch_rd(st.se, 0x254));
+ 	if (touch_rd(st.se, 0x260) != SE_PACK0 || touch_rd(st.se, 0x264) != SE_PACK1 ||
+ 	    touch_rd(st.se, 0x284) != SE_PACK0 || touch_rd(st.se, 0x288) != SE_PACK1 ||
+ 	    touch_rd(st.se, 0x254) != 0) {
+-		printf("SWEET TOUCH: packing readback mismatch; probes skipped\n");
++		touch_log("SWEET TOUCH: packing readback mismatch; probes skipped\n");
+ 		return false;
+ 	}
+ 	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
+ 	    (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-		printf("SWEET TOUCH: inherited FIFO data; probes skipped\n");
++		touch_log("SWEET TOUCH: inherited FIFO data; probes skipped\n");
+ 		return false;
+ 	}
+ 	return true;
+@@ -650,6 +683,13 @@
+ 		}
+ 		tid -= 1;
+ 		unsigned state = ev[0] >> 6;
++		static unsigned logged;
++		if (state != 2 && logged < 40) {
++			++logged;
++			touch_log("SWEET TOUCH: finger %u %s x=%d y=%d\n", tid + 1,
++			    state == 1 ? "down" : state == 3 ? "up" : "?",
++			    (ev[1] << 4) | (ev[3] >> 4), (ev[2] << 4) | (ev[3] & 0x0fu));
++		}
+ 		if (state == 1 || state == 2) { /* press / move */
+ 			s6_mask |= 1u << tid;
+ 			s6_x[tid] = (ev[1] << 4) | (ev[3] >> 4);
+@@ -694,7 +734,7 @@
+ static void
+ touch_guacamole(void)
+ {
+-	printf("SWEET TOUCH: guacamole S6SY761: TLMM rst=%#x irq=%#x 1v8=%#x sda=%#x\n",
++	touch_log("SWEET TOUCH: guacamole S6SY761: TLMM rst=%#x irq=%#x 1v8=%#x sda=%#x\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(GUAC_RST)), touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_IRQ)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(GUAC_1V8)), touch_rd(st.gpio, TOUCH_GPIO_CFG(GUAC_SDA)));
+ 	touch_gpio(GUAC_IRQ, 0, 0, 3, false, false);  /* input, DT bias-disable, 8 mA */
+@@ -703,7 +743,7 @@
+ 	touch_wait(5);
+ 	int power_error = sweet_rpmh_vreg_enable("ldoa17", 3008);
+ 	if (power_error) {
+-		printf("SWEET TOUCH: L17A RPMh enable failed %d; stopping\n", power_error);
++		touch_log("SWEET TOUCH: L17A RPMh enable failed %d; stopping\n", power_error);
+ 		return;
+ 	}
+ 	touch_wait(10);
+@@ -726,7 +766,7 @@
+ 		touch_wait(20);
+ 	}
+ 	st.probing = true;
+-	printf("SWEET TOUCH: s6sy761 boot event %s err=%d ev=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++	touch_log("SWEET TOUCH: s6sy761 boot event %s err=%d ev=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 	    boot ? "seen" : "missing", err, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
+ 	uint8_t bs = 0, fw = 0, id[3] = {0}, info[11] = {0};
+ 	int be = touch_read(GUAC_ADDR, S6_BOOT_STATUS, false, &bs, 1);
+@@ -734,16 +774,16 @@
+ 	int pe = touch_read(GUAC_ADDR, S6_PANEL_INFO, false, info, 11);
+ 	int fe = touch_read(GUAC_ADDR, S6_FW_INTEGRITY, false, &fw, 1);
+ 	st.probing = false;
+-	printf("SWEET TOUCH: s6sy761 boot-status=%#x(err %d) id=%02x%02x%02x(err %d) panel=%ux%u tx=%u(err %d) fw-integrity=%#x(err %d)\n",
++	touch_log("SWEET TOUCH: s6sy761 boot-status=%#x(err %d) id=%02x%02x%02x(err %d) panel=%ux%u tx=%u(err %d) fw-integrity=%#x(err %d)\n",
+ 	    bs, be, id[0], id[1], id[2], ie, (unsigned)touch_be16(info), (unsigned)touch_be16(info + 2),
+ 	    info[8], pe, fw, fe);
+ 	if (st.dead || be || bs != S6_BS_APP) {
+-		printf("SWEET TOUCH: S6SY761 not in application mode; stopping\n");
++		touch_log("SWEET TOUCH: S6SY761 not in application mode; stopping\n");
+ 		return;
+ 	}
+ 	const uint8_t sense = S6_SENSE_ON;
+ 	err = touch_msg(GUAC_ADDR, &sense, 1, NULL, 0, false);
+-	printf("SWEET TOUCH: selected S6SY761 @0x48 SE17, 1440x3120, sense-on err=%d, poll 10 ms + IRQ level\n", err);
++	touch_log("SWEET TOUCH: selected S6SY761 @0x48 SE17, 1440x3120, sense-on err=%d, poll 10 ms + IRQ level\n", err);
+ 	if (err) {
+ 		return;
+ 	}
+@@ -755,7 +795,7 @@
+ 			err = touch_s6();
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+-					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
++					touch_log("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+ 				}
+ 				if (errors == 10) {
+ 					s6_mask = 0;
+@@ -781,16 +821,16 @@
+ 	 * below hangs the SoC, the persistent log and the GUI got there first.
+ 	 */
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+-	printf("SWEET TOUCH: starting in %u s\n", delay_s);
++	touch_log("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+ 	touch_select_board();
+-	printf("SWEET TOUCH: %s: mapping GCC/TLMM %#x/SE %#x\n", hw.guac ? "guacamole" : "sweet",
++	touch_log("SWEET TOUCH: %s: mapping GCC/TLMM %#x/SE %#x\n", hw.guac ? "guacamole" : "sweet",
+ 	    hw.gpio_pa, hw.se_pa);
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+ 	st.gpio = ml_io_map(hw.gpio_pa, hw.gpio_size);
+ 	st.se = ml_io_map(hw.se_pa, 0x4000);
+ 	if (!st.gcc || !st.gpio || !st.se) {
+-		printf("SWEET TOUCH: MMIO mapping failed\n");
++		touch_log("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+ 	if (!touch_clocks() || !touch_se_init()) {
+@@ -800,7 +840,7 @@
+ 		touch_guacamole();
+ 		goto out;
+ 	}
+-	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
++	touch_log("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+ 	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+@@ -808,7 +848,7 @@
+ 	touch_gpio(8, 0, 3, 3, true, false);
+ 	int power_error = sweet_rpmh_vreg_enable("ldoc11", 3200);
+ 	if (power_error) {
+-		printf("SWEET TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
++		touch_log("SWEET TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
+ 		goto out;
+ 	}
+ 	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
+@@ -823,23 +863,23 @@
+ 	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
+ 	st.probing = true;
+ 	int ge = touch_probe_info(GOODIX_PID_REG, gid);
+-	printf("SWEET TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
++	touch_log("SWEET TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+ 	    ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11], st.irq_status);
+ 	(void)touch_probe_info(0x8240, legacy);
+ 	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
+ 	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
+-	printf("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
++	touch_log("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+ 	    fe1, fe2, fid1, fid2, st.irq_status);
+ 	st.probing = false;
+ 	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '9' && gid[3] == '6';
+ 	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
+ 	if (st.dead || goodix == fts) {
+-		printf("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
++		touch_log("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
+ 		    goodix, fts, st.dead);
+ 		goto out;
+ 	}
+ 	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+-	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
++	touch_log("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+ 	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+@@ -849,7 +889,7 @@
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+-					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
++					touch_log("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+ 				}
+ 				if (errors == 10) {
+ 					touch_report(0, st.x, st.y); /* release after persistent bad reads */
+@@ -862,6 +902,14 @@
+ 	}
+ 	touch_report(0, st.x, st.y);
+ out:
++	if (hw.guac) {
++		char last[sizeof(touch_last)];
++		strlcpy(last, touch_last, sizeof(last));
++		for (unsigned i = 0; i < 120; ++i) {
++			printf("SWEET TOUCH: STOPPED, last: %s", last);
++			touch_wait(5000);
++		}
++	}
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -878,14 +926,14 @@
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	if (!enabled) {
+-		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
++		touch_log("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+ 	}
+ 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+-		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
++		touch_log("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
