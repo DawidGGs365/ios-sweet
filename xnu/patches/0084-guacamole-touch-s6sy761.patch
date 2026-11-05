@@ -1,0 +1,457 @@
+diff --color -ruN a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -328,8 +328,9 @@
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+ 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/* ldoc11: sweet PM6150L L11C; ldoa17: guacamole PM8150 L17A (both PMIC5 LDO touch AVDD). */
++	if (!res || (strcmp(res, "ldoc11") && strcmp(res, "ldoa17")) || mv < 2950 || mv > 3400) {
++		printf("SWEET RPMH: expected ldoc11/ldoa17 and 2950..3400 mV\n");
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -14,12 +14,14 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_touch_panel(int w, int h);
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+@@ -81,6 +83,90 @@
+ } st;
+ static int touch_sleep_chan;
+ 
++/*
++ * Board: sweet (SM7150) by default; guacamole (OnePlus 7 Pro, SM8150) when
++ * the ADT root is "oneplus,guacamole". guacamole sources: OOS dtbo 18821
++ * (Samsung_18821@48 on qupv3_se17_i2c), base DTB (SE17 0xc80000), Linux
++ * gcc-sm8150.c / pinctrl-sm8150.c, OnePlus sec_drivers_s6sy761.c.
++ *   QUP SE17 = wrap2 SE3: GCC vote 0x52014 bit 1 s_ahb, bit 2 m_ahb,
++ *   bit 7 s3; RCG 0x1e4d8; halts 0x1e004, 0x1e008, 0x1e4d4 (SM8150 has no
++ *   GCC QUP core clocks). TLMM SOUTH tile 0x03d00000: SDA/SCL gpio55/56
++ *   (function qup17 = 1), reset gpio54, IRQ gpio122 (level low), TP 1.8 V
++ *   switch gpio119 (DT: pull-up = on, pull-down = off); AVDD 3.008 V =
++ *   PM8150 L17A (RPMh ldoa17). Panel 1440x3120.
++ */
++#define GUAC_SE_PA       0x00c80000u
++#define GUAC_SOUTH_PA    0x03d00000u
++#define GUAC_ADDR        0x48u
++#define GUAC_RST         54u
++#define GUAC_SDA         55u
++#define GUAC_SCL         56u
++#define GUAC_1V8         119u
++#define GUAC_IRQ         122u
++#define S6_SENSE_ON      0x10u
++#define S6_FW_INTEGRITY  0x21u
++#define S6_PANEL_INFO    0x23u
++#define S6_DEVICE_ID     0x52u
++#define S6_BOOT_STATUS   0x55u
++#define S6_READ_ONE      0x60u
++#define S6_READ_ALL      0x61u
++#define S6_CLEAR_STACK   0x62u
++#define S6_BS_APP        0x20u
++
++static struct {
++	bool guac;
++	uint32_t se_pa, gpio_pa, gpio_size, vote, vote_mask, rcg;
++	uint32_t branch[5];
++	unsigned nbranch;
++} hw = {
++	false, TOUCH_SE_PA, TOUCH_NORTH_PA, 0x5b000, TOUCH_GCC_VOTE,
++	(0x0fu << 18) | (1u << 23), TOUCH_RCG,
++	{0x18004, 0x18008, 0x1800c, 0x18010, 0x18144}, 5,
++};
++
++static bool
++touch_is_guacamole(void)
++{
++	DTEntry root;
++	void const *prop;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
++		return false;
++	}
++	const char *s = (const char *)prop;
++	for (unsigned int i = 0; i < size;) {
++		unsigned int n = 0;
++		while (i + n < size && s[i + n] != '\0') {
++			n++;
++		}
++		if (n == sizeof("oneplus,guacamole") - 1 && strncmp(s + i, "oneplus,guacamole", n) == 0) {
++			return true;
++		}
++		i += n + 1;
++	}
++	return false;
++}
++
++static void
++touch_select_board(void)
++{
++	if (!touch_is_guacamole()) {
++		return;
++	}
++	hw.guac = true;
++	hw.se_pa = GUAC_SE_PA;
++	hw.gpio_pa = GUAC_SOUTH_PA;
++	hw.gpio_size = (GUAC_IRQ + 1u) * 0x1000u;
++	hw.vote = 0x52014u;
++	hw.vote_mask = (1u << 1) | (1u << 2) | (1u << 7);
++	hw.rcg = 0x1e4d8u;
++	hw.branch[0] = 0x1e004u;
++	hw.branch[1] = 0x1e008u;
++	hw.branch[2] = 0x1e4d4u;
++	hw.nbranch = 3;
++}
++
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -136,16 +222,16 @@
+ static bool
+ touch_clocks(void)
+ {
+-	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
+-	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+-	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+-	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
++	/* Vote on only the touch wrapper and SE, preserving other clock users. */
++	const uint32_t rcg = hw.rcg;
++	touch_wr(st.gcc, hw.vote, touch_rd(st.gcc, hw.vote) | hw.vote_mask);
++	uint32_t dfs = touch_rd(st.gcc, rcg + 0x14u);
++	uint32_t cfg = touch_rd(st.gcc, rcg + 4u);
+ 	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+-	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
++	    touch_rd(st.gcc, hw.vote), touch_rd(st.gcc, rcg), cfg, dfs);
+ 	if (dfs & 1u) {
+ 		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
+-		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
++		cfg = touch_rd(st.gcc, rcg + 0x1cu);
+ 		if ((cfg & 0x371fu) != 1u) {
+ 			printf("SWEET TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
+ 			return false;
+@@ -153,18 +239,17 @@
+ 	} else {
+ 		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
+ 		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
+-		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
+-		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
+-		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
++		touch_wr(st.gcc, rcg + 4u, cfg);
++		touch_wr(st.gcc, rcg, touch_rd(st.gcc, rcg) | 1u);
++		if (!touch_wait_clear(st.gcc, rcg, 1u)) {
+ 			printf("SWEET TOUCH: RCG update timeout\n");
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
+-	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+-		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+-			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+-			    touch_rd(st.gcc, branches[i]));
++	for (unsigned i = 0; i < hw.nbranch; ++i) {
++		if (!touch_wait_clear(st.gcc, hw.branch[i], 1u << 31)) {
++			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", hw.branch[i],
++			    touch_rd(st.gcc, hw.branch[i]));
+ 			return false;
+ 		}
+ 	}
+@@ -492,8 +577,8 @@
+ {
+ 	uint32_t fw = touch_rd(st.se, SE_FW);
+ 	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
+-	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+-	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
++	printf("SWEET TOUCH: se@%#x fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
++	    hw.se_pa, fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, 0x908));
+ 	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+@@ -545,6 +630,146 @@
+ 	return true;
+ }
+ 
++/* S6SY761 (Linux s6sy761.c / OnePlus sec_drivers_s6sy761.c event format). */
++static uint32_t s6_mask;
++static int s6_x[TOUCH_MAX], s6_y[TOUCH_MAX];
++
++static void
++touch_s6_events(const uint8_t *ev, unsigned n)
++{
++	for (unsigned i = 0; i < n; ++i, ev += 8) {
++		if (!ev[0]) {
++			break;
++		}
++		if ((ev[0] & 3u) != 0) {
++			continue; /* status / vendor event, not a coordinate */
++		}
++		unsigned tid = (ev[0] >> 2) & 0x0fu;
++		if (tid == 0 || tid > TOUCH_MAX) {
++			continue;
++		}
++		tid -= 1;
++		unsigned state = ev[0] >> 6;
++		if (state == 1 || state == 2) { /* press / move */
++			s6_mask |= 1u << tid;
++			s6_x[tid] = (ev[1] << 4) | (ev[3] >> 4);
++			s6_y[tid] = (ev[2] << 4) | (ev[3] & 0x0fu);
++		} else if (state == 3) { /* release */
++			s6_mask &= ~(1u << tid);
++		}
++	}
++}
++
++static int
++touch_s6(void)
++{
++	uint8_t ev[8 * TOUCH_MAX];
++	int err = touch_read(GUAC_ADDR, S6_READ_ONE, false, ev, 8);
++	if (err) {
++		return err;
++	}
++	if (!ev[0]) {
++		return 0;
++	}
++	unsigned left = ev[7] & 0x3fu;
++	if (left > TOUCH_MAX - 1) {
++		const uint8_t clear = S6_CLEAR_STACK;
++		(void)touch_msg(GUAC_ADDR, &clear, 1, NULL, 0, false);
++		s6_mask = 0;
++		touch_report(0, s6_x, s6_y);
++		return 0;
++	}
++	if (left) {
++		err = touch_read(GUAC_ADDR, S6_READ_ALL, false, ev + 8, left * 8u);
++		if (err) {
++			return err;
++		}
++	}
++	touch_s6_events(ev, left + 1);
++	touch_report(s6_mask, s6_x, s6_y);
++	return 0;
++}
++
++/* OnePlus sec_power_control order: 1.8 V, 3.0 V AVDD, reset high, boot event, SENSE_ON. */
++static void
++touch_guacamole(void)
++{
++	printf("SWEET TOUCH: guacamole S6SY761: TLMM rst=%#x irq=%#x 1v8=%#x sda=%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(GUAC_RST)), touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_IRQ)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(GUAC_1V8)), touch_rd(st.gpio, TOUCH_GPIO_CFG(GUAC_SDA)));
++	touch_gpio(GUAC_IRQ, 0, 0, 3, false, false);  /* input, DT bias-disable, 8 mA */
++	touch_gpio(GUAC_RST, 0, 0, 3, true, false);   /* hold reset low while rails come up */
++	touch_gpio(GUAC_1V8, 0, 3, 3, false, false);  /* tp_1v8_active: pull-up enables the switch */
++	touch_wait(5);
++	int power_error = sweet_rpmh_vreg_enable("ldoa17", 3008);
++	if (power_error) {
++		printf("SWEET TOUCH: L17A RPMh enable failed %d; stopping\n", power_error);
++		return;
++	}
++	touch_wait(10);
++	touch_gpio(GUAC_SDA, 1, 0, 0, false, false);  /* qup17, 2 mA, bias-disable */
++	touch_gpio(GUAC_SCL, 1, 0, 0, false, false);
++	touch_gpio(GUAC_RST, 0, 0, 3, true, true);
++	touch_wait(150); /* OnePlus RESET_TO_NORMAL_TIME 70 ms, Linux 140 ms */
++
++	uint8_t ev[8] = {0};
++	bool boot = false;
++	int err = 0;
++	for (unsigned i = 0; i < 50 && !st.dead; ++i) {
++		st.probing = i < 3;
++		err = touch_read(GUAC_ADDR, S6_READ_ONE, false, ev, 8);
++		unsigned type = (ev[0] >> 2) & 0x0fu;
++		if (!err && (type == 0x02 || type == 0x07) && ev[1] == 0x00) {
++			boot = true;
++			break;
++		}
++		touch_wait(20);
++	}
++	st.probing = true;
++	printf("SWEET TOUCH: s6sy761 boot event %s err=%d ev=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    boot ? "seen" : "missing", err, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
++	uint8_t bs = 0, fw = 0, id[3] = {0}, info[11] = {0};
++	int be = touch_read(GUAC_ADDR, S6_BOOT_STATUS, false, &bs, 1);
++	int ie = touch_read(GUAC_ADDR, S6_DEVICE_ID, false, id, 3);
++	int pe = touch_read(GUAC_ADDR, S6_PANEL_INFO, false, info, 11);
++	int fe = touch_read(GUAC_ADDR, S6_FW_INTEGRITY, false, &fw, 1);
++	st.probing = false;
++	printf("SWEET TOUCH: s6sy761 boot-status=%#x(err %d) id=%02x%02x%02x(err %d) panel=%ux%u tx=%u(err %d) fw-integrity=%#x(err %d)\n",
++	    bs, be, id[0], id[1], id[2], ie, (unsigned)touch_be16(info), (unsigned)touch_be16(info + 2),
++	    info[8], pe, fw, fe);
++	if (st.dead || be || bs != S6_BS_APP) {
++		printf("SWEET TOUCH: S6SY761 not in application mode; stopping\n");
++		return;
++	}
++	const uint8_t sense = S6_SENSE_ON;
++	err = touch_msg(GUAC_ADDR, &sense, 1, NULL, 0, false);
++	printf("SWEET TOUCH: selected S6SY761 @0x48 SE17, 1440x3120, sense-on err=%d, poll 10 ms + IRQ level\n", err);
++	if (err) {
++		return;
++	}
++	sweet_hid_touch_panel(1440, 3120);
++	unsigned errors = 0, ticks = 0;
++	while (!st.dead) {
++		/* IRQ gpio122 is level-low while events are queued; also read every 100 ms. */
++		if (st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_IRQ)) & 1u) || (++ticks % 10u) == 0) {
++			err = touch_s6();
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
++				}
++				if (errors == 10) {
++					s6_mask = 0;
++					touch_report(0, s6_x, s6_y);
++				}
++			} else {
++				errors = 0;
++			}
++		}
++		touch_wait(10);
++	}
++	touch_report(0, s6_x, s6_y);
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -558,10 +783,12 @@
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+-	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
++	touch_select_board();
++	printf("SWEET TOUCH: %s: mapping GCC/TLMM %#x/SE %#x\n", hw.guac ? "guacamole" : "sweet",
++	    hw.gpio_pa, hw.se_pa);
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+-	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
++	st.gpio = ml_io_map(hw.gpio_pa, hw.gpio_size);
++	st.se = ml_io_map(hw.se_pa, 0x4000);
+ 	if (!st.gcc || !st.gpio || !st.se) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+@@ -569,6 +796,10 @@
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
++	if (hw.guac) {
++		touch_guacamole();
++		goto out;
++	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+diff --color -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -367,7 +367,7 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
+ 	IOLock *fLock;
+-	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fLogicalW, fLogicalH, fNative;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -377,6 +377,8 @@
+ 
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
++/* Touch panel size in pixels; the touch driver sets it (sweet 1080x2400, guacamole 1440x3120). */
++static int gSweetPanelW = 1080, gSweetPanelH = 2400;
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -432,12 +434,10 @@
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	fNative = 0;
++	PE_parse_boot_argn("sweetfb_native", &fNative, sizeof(fNative));
++	fLogicalW = 1125;
++	fLogicalH = 2436;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -458,22 +458,36 @@
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	const int pw = gSweetPanelW, ph = gSweetPanelH;
++	x = x < 0 ? 0 : (x > pw - 1 ? pw - 1 : x);
++	y = y < 0 ? 0 : (y > ph - 1 ? ph - 1 : y);
++	/*
++	 * Panel pixels -> the presented display (SweetFramebuffer.cpp): the
++	 * 1125x2436 iPhone X screen centered on the panel (larger panel:
++	 * negative offset, touches on the black border clamp to its edge).
++	 */
++	const int lw = fNative ? pw : fLogicalW, lh = fNative ? ph : fLogicalH;
++	const int offx = (lw - pw) / 2, offy = (lh - ph) / 2;
++	int lx = x + offx, ly = y + offy;
++	lx = lx < 0 ? 0 : (lx > lw - 1 ? lw - 1 : lx);
++	ly = ly < 0 ? 0 : (ly > lh - 1 ? lh - 1 : ly);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	IOFixed nx = (IOFixed)(((int64_t)lx << 16) / lw);
++	IOFixed ny = (IOFixed)(((int64_t)ly << 16) / lh);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		/* Edges of what is visible: the panel if it is the smaller one, else the presented screen. */
++		const bool panel_edges = pw <= lw && ph <= lh;
++		const int ex = panel_edges ? x : lx, ey = panel_edges ? y : ly;
++		const int ew = panel_edges ? pw : lw, eh = panel_edges ? ph : lh;
++		fEdge[finger] = ex < SWEET_TOUCH_EDGE_PX || ex > ew - 1 - SWEET_TOUCH_EDGE_PX ||
++		    ey < SWEET_TOUCH_EDGE_PX || ey > eh - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+@@ -552,6 +566,15 @@
+ 	}
+ }
+ 
++extern "C" void
++sweet_hid_touch_panel(int w, int h)
++{
++	if (w >= 320 && w <= 4096 && h >= 320 && h <= 4096) {
++		gSweetPanelW = w;
++		gSweetPanelH = h;
++	}
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
