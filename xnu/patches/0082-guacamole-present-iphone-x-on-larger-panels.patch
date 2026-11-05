@@ -1,0 +1,17 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -170,7 +170,13 @@
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++	/*
++	 * Present the iPhone X panel on every board: a smaller panel (sweet,
++	 * 1080x2400) shows its centered part, a larger one (guacamole,
++	 * 1440x3120) shows it centered with a black border (negative offsets;
++	 * the swap copy clips both ways).
++	 */
++	if (!native) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
