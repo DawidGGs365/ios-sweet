@@ -1,0 +1,316 @@
+diff --color -ruN a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c	2026-11-06 00:21:00.653057333 +0100
++++ b/bsd/dev/sweet_rpmh.c	2026-11-06 00:21:00.653853198 +0100
+@@ -234,7 +234,7 @@
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited request for %#x in TCS%u\n", address, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -327,10 +327,31 @@
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	/* ldoc11: sweet PM6150L L11C; ldoa17: guacamole PM8150 L17A (both PMIC5 LDO touch AVDD). */
+-	if (!res || (strcmp(res, "ldoc11") && strcmp(res, "ldoa17")) || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11/ldoa17 and 2950..3400 mV\n");
++	/*
++	 * Board-specific helper: do not apply PMIC5-LDO policy to arbitrary
++	 * resources. Only these PMIC5 LDOs, at their DT voltages:
++	 * ldoc11 sweet PM6150L L11C, ldoa17 guacamole PM8150 L17A (touch AVDD);
++	 * guacamole USB HS PHY (hsphy@88e2000): ldoa5 vdd 0.88 V,
++	 * ldoa12 vdda18 1.8 V, ldoa2 vdda33 3.072 V.
++	 */
++	static const struct {
++		const char *res;
++		unsigned min, max;
++	} allowed[] = {
++		{ "ldoc11", 2950, 3400 },
++		{ "ldoa17", 2950, 3400 },
++		{ "ldoa5", 880, 880 },
++		{ "ldoa12", 1704, 1800 },
++		{ "ldoa2", 3050, 3300 },
++	};
++	bool ok = false;
++	for (unsigned i = 0; res != NULL && i < sizeof(allowed) / sizeof(allowed[0]); i++) {
++		if (strcmp(res, allowed[i].res) == 0 && mv >= allowed[i].min && mv <= allowed[i].max) {
++			ok = true;
++		}
++	}
++	if (!ok) {
++		printf("SWEET RPMH: %s %u mV is not an allowed rail/voltage\n", res ? res : "(null)", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --color -ruN a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c	2026-11-06 00:21:00.653034817 +0100
++++ b/bsd/dev/sweet_usb.c	2026-11-06 00:21:00.653832356 +0100
+@@ -39,6 +39,7 @@
+ #include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);     /* bsd/dev/sweet_rpmh.c */
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -93,12 +94,15 @@
+ 	return false;
+ }
+ 
++static bool usb_guac;
++
+ static void
+ usb_soc_select(void)
+ {
+ 	if (!usb_soc_is_sm8150()) {
+ 		return;
+ 	}
++	usb_guac = true;
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+ 		if (strcmp(usb_cbcr[i].name, "cfg-noc-axi") == 0) {
+ 			usb_cbcr[i].off = 0x0f078;
+@@ -124,6 +128,218 @@
+ 	return v;
+ }
+ 
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Read-modify-write with readback, like Linux msm_usb_write_readback(). */
++static void
++usb_rmw(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t val)
++{
++	usb_wr(base, off, (usb_rd(base, off) & ~mask) | val);
++	if ((usb_rd(base, off) & mask) != val) {
++		printf("SWEET USB: write %#x/%#x to +%#x did not stick (%#x)\n", val, mask, off,
++		    usb_rd(base, off));
++	}
++}
++
++/* Poll until (reg & mask) == want; 1 us steps. */
++static bool
++usb_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i < us; i++) {
++		if ((usb_rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return (usb_rd(base, off) & mask) == want;
++}
++
++/*
++ * SM8150 (guacamole) power-up. On sweet ABL hands over a running
++ * controller and PHY; on guacamole the Aloha UEFI and DarwinBoot run after
++ * ABL and the host sees no device at all, so bring the block up from
++ * scratch like Linux (OnePlus msm-4.14 dwc3-msm.c, phy-msm-snps-hs.c,
++ * gcc-sm8150.c) for high-speed only:
++ *  1. HS PHY rails (DT hsphy@88e2000): L5A 0.88 V, L12A 1.8 V, L2A 3.072 V
++ *  2. USB30_PRIM GDSC on (clear SW_COLLAPSE)
++ *  3. master RCG 200 MHz (GPLL0 main / 3) if it is still on XO
++ *  4. branches cfg-noc, aggre, master, sleep, mock-utmi, clkref
++ *  5. dwc3-msm block reset (GCC_USB30_PRIM_BCR, clocks off around it)
++ *  6. SNPS femto PHY reset (GCC_QUSB2PHY_PRIM_BCR) and msm_hsphy_init()
++ *     with the OnePlus DT param-override-seq
++ *  7. QSCRATCH: RAM clocks (CGCTL), pipe clock from UTMI (no SS PHY),
++ *     GCTL device mode
++ * The existing gadget start then soft-resets the device controller.
++ * Boot-arg sweetusbpower=0 skips this.
++ */
++#define GCC_USB30_PRIM_BCR      0x0f000
++#define GCC_USB30_MASTER_RCG    0x0f01c
++#define GCC_QUSB2PHY_PRIM_BCR   0x12000
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_PWR_ON             (1u << 31)
++#define GDSC_CFG_UP_DONE        (1u << 16)      /* CFG_GDSCR (gdscr + 4), POLL_CFG_GDSCR */
++
++#define FEMTO_PA                0x088e2000
++#define FEMTO_UTMI_CTRL0        0x3c
++#define FEMTO_UTMI_CTRL5        0x50
++#define FEMTO_COMMON0           0x54
++#define FEMTO_COMMON1           0x58
++#define FEMTO_COMMON2           0x5c
++#define FEMTO_CTRL1             0x60
++#define FEMTO_CTRL2             0x64
++#define FEMTO_CFG0              0x94
++#define FEMTO_REFCLK_CTRL       0xa0
++#define FEMTO_RTUNE_SEL         0xb4
++#define FEMTO_RCAL_PA           0x007801f8      /* QFPROM, DT phy_rcal_reg */
++#define FEMTO_RCAL_MASK         0x01e00000      /* DT qcom,rcal-mask */
++
++#define QS_PA                   0x0a6f8800      /* QSCRATCH, DWC3 + 0xf8800 */
++#define QS_GENERAL_CFG          0x08
++#define   PIPE_UTMI_CLK_SEL     (1u << 0)
++#define   PIPE3_PHYSTATUS_SW    (1u << 3)
++#define   PIPE_UTMI_CLK_DIS     (1u << 8)
++#define QS_CGCTL                0x28
++
++static void
++usb_guac_power_up(vm_offset_t gcc)
++{
++	int power = 1;
++	PE_parse_boot_argn("sweetusbpower", &power, sizeof(power));
++	if (!power) {
++		printf("SWEET USB: guacamole power-up skipped (sweetusbpower=0)\n");
++		return;
++	}
++	static const struct {
++		const char *res;
++		unsigned mv;
++	} rails[] = { { "ldoa5", 880 }, { "ldoa12", 1800 }, { "ldoa2", 3072 } };
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		int err = sweet_rpmh_vreg_enable(rails[i].res, rails[i].mv);
++		printf("SWEET USB: rail %s %u mV err=%d\n", rails[i].res, rails[i].mv, err);
++	}
++	delay(1000);
++
++	uint32_t g = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	if (!(g & GDSC_PWR_ON)) {
++		usb_wr(gcc, GCC_USB30_PRIM_GDSCR, g & ~GDSC_SW_COLLAPSE);
++		for (unsigned i = 0; i < 100000 && !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & GDSC_PWR_ON) &&
++		    !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR + 4) & GDSC_CFG_UP_DONE); i++) {
++			delay(1);
++		}
++	}
++	g = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	printf("SWEET USB: GDSC usb30_prim 0x%08x cfg 0x%08x after power-up\n", g,
++	    usb_rd(gcc, GCC_USB30_PRIM_GDSCR + 4));
++	if (!(g & GDSC_PWR_ON) && !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR + 4) & GDSC_CFG_UP_DONE)) {
++		printf("SWEET USB: GDSC did not power up; stopping\n");
++		return;
++	}
++
++	uint32_t cfg = usb_rd(gcc, GCC_USB30_MASTER_RCG + 4);
++	if (((cfg >> 8) & 7u) == 0) {
++		/* gcc-sm8150 ftbl: 200 MHz = GPLL0 main (parent 1), divider 3 (HID 5). */
++		usb_wr(gcc, GCC_USB30_MASTER_RCG + 4, (cfg & ~0x371fu) | (1u << 8) | 5u);
++		usb_wr(gcc, GCC_USB30_MASTER_RCG, usb_rd(gcc, GCC_USB30_MASTER_RCG) | 1u);
++		if (!usb_wait(gcc, GCC_USB30_MASTER_RCG, 1u, 0, 10000)) {
++			printf("SWEET USB: master RCG update timeout\n");
++		}
++	}
++	printf("SWEET USB: master RCG cmd 0x%08x cfg 0x%08x (was 0x%08x)\n",
++	    usb_rd(gcc, GCC_USB30_MASTER_RCG), usb_rd(gcc, GCC_USB30_MASTER_RCG + 4), cfg);
++
++	/* Branches, all SM8150 offsets (cfg-noc gates the DWC3 register path). */
++	static const uint32_t branch[] = { 0x0f078, 0x0f07c, 0x0f010, 0x0f014, 0x0f018, 0x8c008 };
++	static const uint32_t reset_off[] = { 0x0f018, 0x0f014, 0x0f010, 0x0f078 }; /* Linux order */
++	for (unsigned i = 0; i < sizeof(branch) / sizeof(branch[0]); i++) {
++		usb_wr(gcc, branch[i], usb_rd(gcc, branch[i]) | 1u);
++	}
++	for (unsigned i = 0; i < sizeof(reset_off) / sizeof(reset_off[0]); i++) {
++		usb_wr(gcc, reset_off[i], usb_rd(gcc, reset_off[i]) & ~1u);
++	}
++	usb_wr(gcc, GCC_USB30_PRIM_BCR, usb_rd(gcc, GCC_USB30_PRIM_BCR) | 1u);
++	delay(1000);
++	usb_wr(gcc, GCC_USB30_PRIM_BCR, usb_rd(gcc, GCC_USB30_PRIM_BCR) & ~1u);
++	delay(1);
++	for (unsigned i = sizeof(reset_off) / sizeof(reset_off[0]); i-- > 0;) {
++		usb_wr(gcc, reset_off[i], usb_rd(gcc, reset_off[i]) | 1u);
++	}
++	bool clocks = true;
++	for (unsigned i = 0; i < sizeof(branch) / sizeof(branch[0]); i++) {
++		if (!usb_wait(gcc, branch[i], CBCR_CLK_OFF, 0, 10000)) {
++			printf("SWEET USB: branch %#x still off (0x%08x)\n", branch[i], usb_rd(gcc, branch[i]));
++			if (branch[i] != 0x8c008) {
++				clocks = false;
++			}
++		}
++	}
++	delay(10000);
++	if (!clocks) {
++		printf("SWEET USB: controller clocks off after block reset; stopping\n");
++		return;
++	}
++
++	/* SNPS femto HS PHY: block reset, then msm_hsphy_init(). */
++	usb_wr(gcc, GCC_QUSB2PHY_PRIM_BCR, usb_rd(gcc, GCC_QUSB2PHY_PRIM_BCR) | 1u);
++	delay(150);
++	usb_wr(gcc, GCC_QUSB2PHY_PRIM_BCR, usb_rd(gcc, GCC_QUSB2PHY_PRIM_BCR) & ~1u);
++	delay(100);
++	vm_offset_t phy = ml_io_map(FEMTO_PA, 0x1000);
++	vm_offset_t rcal = ml_io_map(FEMTO_RCAL_PA & ~0xfffu, 0x1000);
++	if (phy == 0) {
++		printf("SWEET USB: femto PHY map failed\n");
++		return;
++	}
++	usb_rmw(phy, FEMTO_CFG0, 1u << 1, 1u << 1);             /* UTMI_PHY_CMN_CTRL_OVERRIDE_EN */
++	usb_rmw(phy, FEMTO_UTMI_CTRL5, 1u << 1, 1u << 1);       /* POR */
++	usb_rmw(phy, FEMTO_COMMON0, 7u << 4, 0);                /* FSEL */
++	usb_rmw(phy, FEMTO_COMMON1, 1u << 5, 1u << 5);          /* PLLBTUNE */
++	usb_rmw(phy, FEMTO_REFCLK_CTRL, 3u, 2u);                /* REFCLK_SEL_DEFAULT */
++	usb_rmw(phy, FEMTO_COMMON1, 1u << 4, 1u << 4);          /* VBUSVLDEXTSEL0 */
++	usb_rmw(phy, FEMTO_CTRL1, 1u << 0, 1u << 0);            /* VBUSVLDEXT0 */
++	/* OnePlus dtbo param-override-seq <value offset>: 0x67@0x6c 0x06@0x70 0x28@0x74 */
++	usb_wr(phy, 0x6c, 0x67);
++	usb_wr(phy, 0x70, 0x06);
++	usb_wr(phy, 0x74, 0x28);
++	uint32_t code = rcal ? (usb_rd(rcal, FEMTO_RCAL_PA & 0xfffu) & FEMTO_RCAL_MASK) : 0;
++	if (!code) {
++		usb_rmw(phy, FEMTO_RTUNE_SEL, 1u, 1u);          /* external resistor */
++	}
++	usb_rmw(phy, FEMTO_COMMON2, 1u, 1u);                    /* VREGBYPASS */
++	usb_rmw(phy, FEMTO_CTRL2, 3u << 2, 3u << 2);            /* USB2_SUSPEND_N_SEL | USB2_SUSPEND_N */
++	usb_rmw(phy, FEMTO_UTMI_CTRL0, 1u, 1u);                 /* SLEEPM */
++	usb_rmw(phy, FEMTO_UTMI_CTRL5, 1u << 1, 0);             /* POR release */
++	usb_rmw(phy, FEMTO_CTRL2, 1u << 3, 0);                  /* USB2_SUSPEND_N_SEL */
++	usb_rmw(phy, FEMTO_CFG0, 1u << 1, 0);
++	printf("SWEET USB: femto PHY init done, rcal 0x%08x, x0..x2 0x%02x 0x%02x 0x%02x\n", code,
++	    usb_rd(phy, 0x6c), usb_rd(phy, 0x70), usb_rd(phy, 0x74));
++
++	vm_offset_t qs = ml_io_map(QS_PA, 0x100);
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	if (qs == 0 || dwc == 0) {
++		printf("SWEET USB: QSCRATCH/DWC3 map failed\n");
++		return;
++	}
++	usb_wr(qs, QS_CGCTL, usb_rd(qs, QS_CGCTL) | 0x18u);
++	/* dwc3-msm POST_RESET for maximum-speed high-speed: pipe clock from UTMI. */
++	usb_wr(qs, QS_GENERAL_CFG, usb_rd(qs, QS_GENERAL_CFG) | PIPE_UTMI_CLK_DIS);
++	delay(5);
++	usb_wr(qs, QS_GENERAL_CFG, usb_rd(qs, QS_GENERAL_CFG) | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
++	delay(5);
++	usb_wr(qs, QS_GENERAL_CFG, usb_rd(qs, QS_GENERAL_CFG) & ~PIPE_UTMI_CLK_DIS);
++	/* GCTL: device role (PRTCAPDIR 2), clock gating off (DT snps,disable-clk-gating). */
++	usb_wr(dwc, 0xc110, (usb_rd(dwc, 0xc110) & ~(3u << 12)) | (2u << 12) | 1u);
++	/* GUSB2PHYCFG: no PHY suspend while we bring it up. */
++	usb_wr(dwc, 0xc200, usb_rd(dwc, 0xc200) & ~(1u << 6));
++	printf("SWEET USB: guacamole power-up done: GENERAL_CFG 0x%08x GCTL 0x%08x GUSB2PHYCFG 0x%08x\n",
++	    usb_rd(qs, QS_GENERAL_CFG), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc200));
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -142,6 +358,11 @@
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
++	if (usb_guac && enabled >= 2) {
++		printf("SWEET USB: as found: GDSC 0x%08x master 0x%08x cfg-noc 0x%08x\n",
++		    usb_rd(gcc, GCC_USB30_PRIM_GDSCR), usb_rd(gcc, 0x0f010), usb_rd(gcc, 0x0f078));
++		usb_guac_power_up(gcc);
++	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+@@ -171,6 +392,9 @@
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
++	if (usb_guac) {
++		return; /* SNPS femto PHY, not QUSB2: the QUSB2 offsets below do not exist */
++	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
