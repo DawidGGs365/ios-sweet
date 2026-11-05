@@ -1,0 +1,19 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 00:50:45.440679061 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 00:50:45.449108707 +0100
+@@ -280,6 +280,15 @@
+ 		}
+ 	}
+ 	for (unsigned i = 0; i < hw.nbranch; ++i) {
++		/*
++		 * Linux clk_branch_wait(): no halt check while the branch is in
++		 * hardware clock-gating mode (CBCR HW_CTL, bit 1), where CLK_OFF
++		 * reads 1 whenever the clock is idle (guacamole wrap2 s_ahb
++		 * 0x1e008 = 0x80000002).
++		 */
++		if (touch_rd(st.gcc, hw.branch[i]) & (1u << 1)) {
++			continue;
++		}
+ 		if (!touch_wait_clear(st.gcc, hw.branch[i], 1u << 31)) {
+ 			touch_log("SWEET TOUCH: GCC branch %#x halted (%#x)\n", hw.branch[i],
+ 			    touch_rd(st.gcc, hw.branch[i]));
