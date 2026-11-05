@@ -1,0 +1,35 @@
+diff --color -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-06 00:23:05.845967769 +0100
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-06 00:23:05.846667898 +0100
+@@ -256,17 +256,23 @@
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
++		/*
++		 * Blank once, write-only. The panel memory is write-combined: the
++		 * old fade read every pixel back (uncached) 7 times, which on the
++		 * 1440x3120 guacamole panel held this vsync handler for seconds,
++		 * stalled vsync notifications and made sleep take ~10 s.
++		 */
+ 		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
+-			fb->fFadeStep = step + 1;
+-		}
++		fb->fFadeStep = 1;
+ 		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
++		if (step == 0) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++				volatile uint64_t *row = (volatile uint64_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				for (uint32_t x = 0; x < fb->fWidth / 2; x++) {
++					row[x] = 0;
++				}
++				if (fb->fWidth & 1u) {
++					((volatile uint32_t *)row)[fb->fWidth - 1] = 0;
+ 				}
+ 			}
+ 		}
