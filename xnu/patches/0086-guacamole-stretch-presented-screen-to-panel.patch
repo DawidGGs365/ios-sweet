@@ -1,0 +1,156 @@
+diff --color -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-06 00:11:43.461039269 +0100
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-06 00:11:43.461691719 +0100
+@@ -379,6 +379,7 @@
+ static SweetHIDTouch *gSweetTouch;
+ /* Touch panel size in pixels; the touch driver sets it (sweet 1080x2400, guacamole 1440x3120). */
+ static int gSweetPanelW = 1080, gSweetPanelH = 2400;
++extern "C" int sweet_fb_stretched;      /* SweetFramebuffer.cpp */
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -469,6 +470,11 @@
+ 	const int lw = fNative ? pw : fLogicalW, lh = fNative ? ph : fLogicalH;
+ 	const int offx = (lw - pw) / 2, offy = (lh - ph) / 2;
+ 	int lx = x + offx, ly = y + offy;
++	if (!fNative && sweet_fb_stretched) {
++		/* The presented screen is stretched to fill the panel. */
++		lx = (int)((int64_t)x * lw / pw);
++		ly = (int)((int64_t)y * lh / ph);
++	}
+ 	lx = lx < 0 ? 0 : (lx > lw - 1 ? lw - 1 : lx);
+ 	ly = ly < 0 ? 0 : (ly > lh - 1 ? lh - 1 : ly);
+ 
+diff --color -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-06 00:11:43.461058819 +0100
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-06 00:11:43.461712035 +0100
+@@ -37,6 +37,13 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++/*
++ * Set when a panel larger than the presented 1125x2436 screen (guacamole,
++ * 1440x3120: 1.28x both ways) shows it stretched to fill the panel instead
++ * of centered with a black border. SweetHID.cpp maps touches the same way.
++ */
++extern "C" int sweet_fb_stretched;
++int sweet_fb_stretched;
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -104,6 +111,8 @@
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fStretch;                 /* scale the presented screen to the panel */
++	uint16_t     *fColMap;                  /* panel column -> presented column */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -122,6 +131,8 @@
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void presentStretched(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
++	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -182,6 +193,20 @@
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	int stretch = 1;
++	PE_parse_boot_argn("sweetfb_stretch", &stretch, sizeof(stretch));
++	fStretch = !native && stretch && fWidth > fLogicalW && fHeight > fLogicalH;
++	if (fStretch) {
++		fColMap = IONew(uint16_t, fWidth);
++		if (fColMap == NULL) {
++			fStretch = false;
++		} else {
++			for (uint32_t px = 0; px < fWidth; px++) {
++				fColMap[px] = (uint16_t)((uint64_t)px * fLogicalW / fWidth);
++			}
++		}
++	}
++	sweet_fb_stretched = fStretch;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -365,6 +390,13 @@
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fStretch) {
++			if (bpe == 4) {
++				presentStretched(s, src, sx, sy, dx, dy, w, h);
++			}
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+@@ -407,6 +439,62 @@
+ 	}
+ }
+ 
++/*
++ * Nearest-neighbour scale of one layer from presented (logical) to panel
++ * coordinates. Panel row/column p shows logical p * L / P; repeated rows
++ * are copied from the panel row above.
++ */
++void
++AppleCLCD::presentStretched(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
++    int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	const int64_t lw = fLogicalW, lh = fLogicalH, pw = fWidth, ph = fHeight;
++	if (w > (int32_t)s->width - sx) {
++		w = (int32_t)s->width - sx;
++	}
++	if (h > (int32_t)s->height - sy) {
++		h = (int32_t)s->height - sy;
++	}
++	if (w > (int32_t)lw - dx) {
++		w = (int32_t)lw - dx;
++	}
++	if (h > (int32_t)lh - dy) {
++		h = (int32_t)lh - dy;
++	}
++	if (src == 0 || w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
++	    s->memory == NULL) {
++		return;
++	}
++	uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++	    (uint64_t)(sx + w) * 4;
++	if (last > s->memory->getLength()) {
++		return;
++	}
++	int64_t px0 = (dx * pw + lw - 1) / lw, px1 = ((dx + w) * pw + lw - 1) / lw;
++	int64_t py0 = (dy * ph + lh - 1) / lh, py1 = ((dy + h) * ph + lh - 1) / lh;
++	px1 = px1 > pw ? pw : px1;
++	py1 = py1 > ph ? ph : py1;
++	if (px1 <= px0 || py1 <= py0) {
++		return;
++	}
++	const size_t bytes = (size_t)(px1 - px0) * 4;
++	int64_t prev = -1;
++	for (int64_t py = py0; py < py1; py++) {
++		int64_t ly = py * lh / ph;
++		uint32_t *dst = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
++		if (ly == prev) {
++			memcpy(dst, (const void *)((uintptr_t)dst - fRowBytes), bytes);
++			continue;
++		}
++		prev = ly;
++		const uint32_t *row = (const uint32_t *)(src + s->offset +
++		    (uint64_t)(sy + (ly - dy)) * s->bytesPerRow + (uint64_t)sx * 4);
++		for (int64_t px = px0; px < px1; px++) {
++			*dst++ = row[fColMap[px] - dx];
++		}
++	}
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
