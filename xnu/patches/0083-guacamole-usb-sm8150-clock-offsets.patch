@@ -1,0 +1,84 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -21,6 +21,7 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -47,7 +48,7 @@
+ #define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+-static const struct {
++static struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+@@ -60,6 +61,56 @@
+ 	{ "clkref", 0x8c010 },
+ };
+ 
++/*
++ * The table above is SM7150 (sweet, gcc-sm7150.c). SM8150 (guacamole,
++ * gcc-sm8150.c) has the same GDSC, master/sleep/utmi and ahb2phy, but
++ * cfg-noc-axi 0xf078, aggre-axi 0xf07c and clkref 0x8c008. cfg-noc-axi
++ * gates the DWC3 reads, so a wrong offset either skips USB or reads an
++ * unclocked block (bus hang). DWC3, QSCRATCH and the HS PHY share their
++ * addresses on both SoCs.
++ */
++static bool
++usb_soc_is_sm8150(void)
++{
++	DTEntry root;
++	void const *prop;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
++		return false;
++	}
++	const char *s = (const char *)prop;
++	for (unsigned int i = 0; i < size;) {
++		unsigned int n = 0;
++		while (i + n < size && s[i + n] != '\0') {
++			n++;
++		}
++		if (n == sizeof("oneplus,guacamole") - 1 && strncmp(s + i, "oneplus,guacamole", n) == 0) {
++			return true;
++		}
++		i += n + 1;
++	}
++	return false;
++}
++
++static void
++usb_soc_select(void)
++{
++	if (!usb_soc_is_sm8150()) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++		if (strcmp(usb_cbcr[i].name, "cfg-noc-axi") == 0) {
++			usb_cbcr[i].off = 0x0f078;
++		} else if (strcmp(usb_cbcr[i].name, "aggre-axi") == 0) {
++			usb_cbcr[i].off = 0x0f07c;
++		} else if (strcmp(usb_cbcr[i].name, "clkref") == 0) {
++			usb_cbcr[i].off = 0x8c008;
++		}
++	}
++	printf("SWEET USB: SM8150 (guacamole) GCC clock offsets\n");
++}
++
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+ #define QUSB2_PA                0x088e2000
+@@ -85,6 +136,7 @@
+ 	if (!enabled) {
+ 		return;
+ 	}
++	usb_soc_select();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
