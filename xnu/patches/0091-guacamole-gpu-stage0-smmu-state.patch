@@ -1,0 +1,79 @@
+diff --color -ruN a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c	2026-11-06 00:56:15.425336888 +0100
++++ b/bsd/dev/sweet_gpu.c	2026-11-06 00:56:15.433808216 +0100
+@@ -35,6 +35,8 @@
+ #define GPUCC_SIZE              0x00002000u
+ #define GMU_PA                  0x02c6a000u
+ #define GMU_SIZE                0x00030000u
++#define SMMU_PA                 0x02ca0000u     /* DT kgsl-smmu, qcom,qsmmu-v500 */
++#define SMMU_SIZE               0x00010000u
+ 
+ /* GCC (gcc-sm8150.c) */
+ #define GCC_GPU_VOTE            0x52004         /* bit 15 gpll0, bit 16 gpll0 div */
+@@ -127,6 +129,58 @@
+ 	    gpu_rd(g_cc, GPUCC_CX_APB), gpu_rd(g_cc, GPUCC_CX_SNOC_DVM), gpu_rd(g_cc, GPUCC_CXO_AON));
+ }
+ 
++/*
++ * GPU SMMU (ARM MMU-500) state as the boot firmware left it (DT
++ * qcom,skip-init): the GMU firmware runs partly from icache/dcache memory
++ * behind this SMMU (a640_gmu.bin blocks at GMU VA 0x4000 and 0x57000), so
++ * stage 1 needs a context bank for the GMU stream (DT gmu_kernel SID 5,
++ * mask 0x400). Read-only: global ID/config, valid stream match groups and
++ * the context banks they route to.
++ */
++static void
++gpu_smmu_report(void)
++{
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!smmu) {
++		printf("SWEET GPU: SMMU map failed\n");
++		return;
++	}
++	uint32_t idr0 = gpu_rd(smmu, 0x20), idr1 = gpu_rd(smmu, 0x24);
++	uint32_t pagesize = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
++	uint32_t numpage = 1u << (((idr1 >> 28) & 7u) + 1u);
++	uint32_t nsmr = idr0 & 0xffu, ncb = idr1 & 0xffu;
++	printf("SWEET GPU: SMMU sCR0 0x%08x IDR0 0x%08x IDR1 0x%08x IDR2 0x%08x IDR7 0x%08x smr %u cb %u page %#x x%u\n",
++	    gpu_rd(smmu, 0x0), idr0, idr1, gpu_rd(smmu, 0x28), gpu_rd(smmu, 0x3c), nsmr, ncb, pagesize, numpage);
++	if ((uint64_t)pagesize * numpage * 2u > SMMU_SIZE) {
++		printf("SWEET GPU: SMMU layout larger than the DT region; context banks not read\n");
++		return;
++	}
++	uint32_t cb_used = 0;
++	for (uint32_t i = 0; i < nsmr && i < 128u; i++) {
++		uint32_t smr = gpu_rd(smmu, 0x800 + 4 * i), s2cr = gpu_rd(smmu, 0xc00 + 4 * i);
++		if (!(smr & (1u << 31))) {
++			continue;
++		}
++		uint32_t cb = s2cr & 0xffu, type = (s2cr >> 16) & 3u;
++		if (type == 0 && cb < 32) {
++			cb_used |= 1u << cb;
++		}
++		printf("SWEET GPU: SMMU smr%u id 0x%x mask 0x%x s2cr 0x%08x (%s cb %u)\n", i, smr & 0xffffu,
++		    (smr >> 16) & 0x7fffu, s2cr, type == 0 ? "translate" : type == 1 ? "bypass" : "fault", cb);
++	}
++	vm_offset_t gr1 = smmu + pagesize, cbase = smmu + (vm_offset_t)pagesize * numpage;
++	for (uint32_t n = 0; n < ncb && n < 32u; n++) {
++		uint32_t sctlr = gpu_rd(cbase + (vm_offset_t)n * pagesize, 0x0);
++		if (!(cb_used & (1u << n)) && !(sctlr & 1u)) {
++			continue;
++		}
++		vm_offset_t cb = cbase + (vm_offset_t)n * pagesize;
++		printf("SWEET GPU: SMMU cb%u cbar 0x%08x cba2r 0x%08x sctlr 0x%08x ttbr0 0x%08x%08x tcr 0x%08x fsr 0x%08x\n",
++		    n, gpu_rd(gr1, 4 * n), gpu_rd(gr1, 0x800 + 4 * n), sctlr, gpu_rd(cb, 0x24), gpu_rd(cb, 0x20),
++		    gpu_rd(cb, 0x30), gpu_rd(cb, 0x58));
++	}
++}
++
+ /* The GMU block is only safe to read with CX powered and the GMU/AHB clocks running. */
+ static bool
+ gpu_gmu_readable(void)
+@@ -186,6 +240,7 @@
+ 		(void)gpu_branch_on(g_cc, GPUCC_CX_APB, true);
+ 		(void)gpu_branch_on(g_cc, GPUCC_CX_SNOC_DVM, true);
+ 		gpu_report("CX powered");
++		gpu_smmu_report();
+ 	}
+ 	if (!gpu_gmu_readable()) {
+ 		printf("SWEET GPU: CX/GMU clocks off; GMU not read\n");
