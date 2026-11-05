@@ -274,6 +274,12 @@ def build(seed=None, qemu=False, highmem=False):
     ])
 
     product_props = d22ap_product()
+    if product_props and GUACAMOLE:
+        # The panel is 8-bit sRGB and backboardd's GL path draws BGRA only. With the
+        # iPhone X's P3 answer WebKit asks for 10-bit 'w30r' / 'b3a8' page tiles, which its
+        # GPU process never fills here (Safari black, jb1/jb2: "CGImageCreate: invalid
+        # image bits/pixel or bytes/row"); its BGRA surfaces it draws.
+        product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the

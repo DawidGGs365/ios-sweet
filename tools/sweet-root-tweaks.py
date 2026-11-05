@@ -2,7 +2,7 @@
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
   sudo sweet-root-tweaks.py MOUNTED_ROOT
-  sweet-root-tweaks.py --launchd-plist IN OUT
+  sweet-root-tweaks.py --launchd-plist IN OUT [--net]
 
 The second form only applies the launchd.plist changes to a copy of the file
 (IN: /System/Library/xpc/launchd.plist from the IPSW or the phone), for
@@ -25,7 +25,11 @@ screen (image versions v8-v14 in NOTES.md):
                   job com.sweet.autorun runs /usr/libexec/sweet-autorun
                   (userland/autorun) at boot; com.apple.backboardd runs
                   /usr/libexec/sweet-bbd (userland/bbd), which execs the real
-                  backboardd with our library in DYLD_INSERT_LIBRARIES
+                  backboardd with our library in DYLD_INSERT_LIBRARIES;
+                  guacamole: com.sweet.wland (Wi-Fi, /var/local/bin/wland up 0)
+                  and com.sweet.sshd (the rootless Procursus bootstrap's sshd in
+                  /var/jb), both RunAtLoad, so Wi-Fi and SSH come up on every
+                  boot without a SWEETBOX autorun.sh
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -77,6 +81,26 @@ AUTORUN_JOB = {
 }
 
 
+# guacamole: Wi-Fi (userland/wland, copied to /var/local/bin) and SSH (Procursus bootstrap in
+# /var/jb) at every boot. wland keeps itself running ("up 0"); sshd is restarted if it exits.
+NET_JOBS = {
+    '/System/Library/LaunchDaemons/com.sweet.wland.plist': {
+        'Label': 'com.sweet.wland',
+        'ProgramArguments': ['/var/local/bin/wland', 'up', '0'],
+        'RunAtLoad': True,
+        'POSIXSpawnType': 'Interactive',
+        'StandardOutPath': '/var/local/wland.out',
+        'StandardErrorPath': '/var/local/wland.out',
+    },
+    '/System/Library/LaunchDaemons/com.sweet.sshd.plist': {
+        'Label': 'com.sweet.sshd',
+        'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D'],
+        'RunAtLoad': True,
+        'KeepAlive': True,
+        'POSIXSpawnType': 'Interactive',
+    },
+}
+
 BBD_WRAPPER = '/usr/libexec/sweet-bbd'
 REMOVED_JOBS = ('com.apple.CommCenter', 'com.apple.fairplayd.H2')
 
@@ -100,6 +124,9 @@ def launchd_plist(src, dst):
     for k in removed:
         del jobs[k]
     jobs[AUTORUN_KEY] = dict(AUTORUN_JOB)
+    if '--net' in sys.argv:
+        for k, j in NET_JOBS.items():
+            jobs[k] = dict(j)
     for job in jobs.values():
         if job.get('Label') == 'com.apple.backboardd':
             job['ProgramArguments'] = [BBD_WRAPPER]
@@ -160,7 +187,7 @@ def audio(root):
 
 
 def main():
-    if len(sys.argv) == 4 and sys.argv[1] == '--launchd-plist':
+    if len(sys.argv) in (4, 5) and sys.argv[1] == '--launchd-plist':
         launchd_plist(sys.argv[2], sys.argv[3])
         return
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
