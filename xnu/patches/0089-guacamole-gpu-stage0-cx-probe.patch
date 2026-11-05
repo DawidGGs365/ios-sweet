@@ -1,0 +1,257 @@
+diff --color -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-06 00:28:46.047602348 +0100
++++ b/bsd/conf/files	2026-11-06 00:28:46.047608546 +0100
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --color -ruN a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c	1970-01-01 01:00:00.000000000 +0100
++++ b/bsd/dev/sweet_gpu.c	2026-11-06 00:28:33.452530577 +0100
+@@ -0,0 +1,223 @@
++/*
++ * SWEET: Adreno 640 (guacamole, SM8150) bring-up, stage 0 - CX probe.
++ *
++ * GPU acceleration roadmap (CoreAnimation renders in software today):
++ *   0. this file: power the GPU CX side (CX GDSC, GPU CC / GCC clocks)
++ *      and read the GMU state; no GX, no firmware, no TrustZone calls.
++ *   1. GMU boot: load a640_gmu.bin (OOS vendor/firmware) into the GMU
++ *      ITCM/DTCM, release CM3 reset, HFI handshake (Linux a6xx_gmu.c).
++ *   2. GX on through the GMU, SQE microcode a630_sqe.fw, ringbuffer,
++ *      zap shader a640_zap.mdt via SCM PAS, KGSL SMMU context bank.
++ *   3. IOKit user client with an msm-DRM-like UAPI (BOs, submit, fence)
++ *      for a Mesa freedreno GLES build, then CoreAnimation's GL path.
++ *
++ * Addresses: DT qcom,gpucc (gpucc-sm8150.c), qcom,gmu@0x2C6A000; GMU
++ * registers are dword offsets (a6xx_gmu.xml.h) from 0x2c6a000.
++ * Boot-arg sweetgpu: 0 off (default), 1 read state only, 2 also power CX.
++ * Runs in its own thread after sweetgpudelay seconds (default 60).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_gpu_init(void);
++
++#define GPU_GCC_PA              0x00100000u
++#define GPU_GCC_SIZE            0x00090000u
++#define GPUCC_PA                0x02c90000u
++#define GPUCC_SIZE              0x00002000u
++#define GMU_PA                  0x02c6a000u
++#define GMU_SIZE                0x00030000u
++
++/* GCC (gcc-sm8150.c) */
++#define GCC_GPU_VOTE            0x52004         /* bit 15 gpll0, bit 16 gpll0 div */
++#define GCC_GPU_CFG_AHB         0x71004
++#define GCC_GPU_MEMNOC_GFX      0x7100c
++#define GCC_GPU_SNOC_DVM_GFX    0x71018
++
++/* GPU CC (gpucc-sm8150.c) */
++#define GPUCC_GX_GDSCR          0x100c
++#define GPUCC_CX_GDSCR          0x106c
++#define GPUCC_CX_GDS_HW_CTRL    0x1540
++#define GPUCC_GMU_RCG           0x1120
++#define GPUCC_CXO_AON           0x1004
++#define GPUCC_AHB               0x1078          /* BRANCH_HALT_DELAY: no halt bit check */
++#define GPUCC_CX_APB            0x1088
++#define GPUCC_CX_SNOC_DVM       0x108c
++#define GPUCC_CX_GMU            0x1098
++#define GPUCC_CXO               0x109c
++
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_PWR_ON             (1u << 31)
++#define CBCR_OFF                (1u << 31)
++
++/* GMU, byte offsets = a6xx_gmu.xml.h dword offsets << 2 */
++#define GMU_CM3_SYSRESET        (0x5000u << 2)
++#define GMU_CM3_FW_INIT_RESULT  (0x501cu << 2)
++#define GMU_SPTPRAC_PWR_CLK     (0x50d0u << 2)
++#define GMU_CX_RPMH_POWER_STATE (0x50ecu << 2)
++#define GMU_HFI_CTRL_STATUS     (0x5180u << 2)
++#define GMU_GENERAL_7           (0x51ccu << 2)
++#define GMU_AO_HOST_INT_STATUS  (0x9305u << 2)
++
++static vm_offset_t g_gcc, g_cc, g_gmu;
++static int gpu_sleep_chan;
++
++static uint32_t
++gpu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gpu_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++gpu_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&gpu_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++gpu_branch_on(vm_offset_t base, uint32_t off, bool check)
++{
++	gpu_wr(base, off, gpu_rd(base, off) | 1u);
++	if (!check) {
++		delay(10);
++		return true;
++	}
++	for (unsigned i = 0; i < 2000; i++) {
++		if (!(gpu_rd(base, off) & CBCR_OFF)) {
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET GPU: branch %#x still off (0x%08x)\n", off, gpu_rd(base, off));
++	return false;
++}
++
++static void
++gpu_report(const char *when)
++{
++	printf("SWEET GPU: %s: GCC vote 0x%08x cfg-ahb 0x%08x memnoc 0x%08x snoc-dvm 0x%08x\n", when,
++	    gpu_rd(g_gcc, GCC_GPU_VOTE), gpu_rd(g_gcc, GCC_GPU_CFG_AHB),
++	    gpu_rd(g_gcc, GCC_GPU_MEMNOC_GFX), gpu_rd(g_gcc, GCC_GPU_SNOC_DVM_GFX));
++	printf("SWEET GPU: %s: CX GDSC 0x%08x hw-ctrl 0x%08x GX GDSC 0x%08x gmu-rcg 0x%08x/0x%08x\n", when,
++	    gpu_rd(g_cc, GPUCC_CX_GDSCR), gpu_rd(g_cc, GPUCC_CX_GDS_HW_CTRL), gpu_rd(g_cc, GPUCC_GX_GDSCR),
++	    gpu_rd(g_cc, GPUCC_GMU_RCG), gpu_rd(g_cc, GPUCC_GMU_RCG + 4));
++	printf("SWEET GPU: %s: cc ahb 0x%08x cx-gmu 0x%08x cxo 0x%08x cx-apb 0x%08x snoc-dvm 0x%08x aon 0x%08x\n",
++	    when, gpu_rd(g_cc, GPUCC_AHB), gpu_rd(g_cc, GPUCC_CX_GMU), gpu_rd(g_cc, GPUCC_CXO),
++	    gpu_rd(g_cc, GPUCC_CX_APB), gpu_rd(g_cc, GPUCC_CX_SNOC_DVM), gpu_rd(g_cc, GPUCC_CXO_AON));
++}
++
++/* The GMU block is only safe to read with CX powered and the GMU/AHB clocks running. */
++static bool
++gpu_gmu_readable(void)
++{
++	return (gpu_rd(g_cc, GPUCC_CX_GDSCR) & GDSC_PWR_ON) &&
++	       !(gpu_rd(g_cc, GPUCC_CX_GMU) & CBCR_OFF) && (gpu_rd(g_cc, GPUCC_AHB) & 1u) &&
++	       !(gpu_rd(g_gcc, GCC_GPU_CFG_AHB) & CBCR_OFF);
++}
++
++static void
++gpu_thread(void *arg, wait_result_t result)
++{
++	int mode = (int)(uintptr_t)arg;
++	unsigned delay_s = 60;
++	(void)result;
++	(void)PE_parse_boot_argn("sweetgpudelay", &delay_s, sizeof(delay_s));
++	printf("SWEET GPU: stage 0 probe (mode %d) in %u s\n", mode, delay_s);
++	gpu_wait(delay_s * 1000u);
++
++	g_gcc = ml_io_map(GPU_GCC_PA, GPU_GCC_SIZE);
++	g_cc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++	if (!g_gcc || !g_cc) {
++		printf("SWEET GPU: GCC/GPU CC map failed\n");
++		goto out;
++	}
++	/* GPU CC registers need the GCC config AHB clock. */
++	if (gpu_rd(g_gcc, GCC_GPU_CFG_AHB) & CBCR_OFF) {
++		if (mode < 2) {
++			printf("SWEET GPU: GCC gpu cfg-ahb clock off (0x%08x); GPU CC not read in mode 1\n",
++			    gpu_rd(g_gcc, GCC_GPU_CFG_AHB));
++			goto out;
++		}
++		if (!gpu_branch_on(g_gcc, GCC_GPU_CFG_AHB, true)) {
++			goto out;
++		}
++	}
++	gpu_report("as found");
++	if (mode >= 2) {
++		/* Linux a6xx_gmu_resume order: GCC GPU clocks, CX GDSC, GMU clocks. */
++		gpu_wr(g_gcc, GCC_GPU_VOTE, gpu_rd(g_gcc, GCC_GPU_VOTE) | (1u << 15) | (1u << 16));
++		(void)gpu_branch_on(g_gcc, GCC_GPU_MEMNOC_GFX, true);
++		(void)gpu_branch_on(g_gcc, GCC_GPU_SNOC_DVM_GFX, true);
++		uint32_t g = gpu_rd(g_cc, GPUCC_CX_GDSCR);
++		if (!(g & GDSC_PWR_ON)) {
++			gpu_wr(g_cc, GPUCC_CX_GDSCR, g & ~GDSC_SW_COLLAPSE);
++			for (unsigned i = 0; i < 500 && !(gpu_rd(g_cc, GPUCC_CX_GDSCR) & GDSC_PWR_ON); i++) {
++				delay(1000); /* DT qcom,gds-timeout 500 ms */
++			}
++		}
++		if (!(gpu_rd(g_cc, GPUCC_CX_GDSCR) & GDSC_PWR_ON)) {
++			printf("SWEET GPU: CX GDSC did not power up (0x%08x)\n", gpu_rd(g_cc, GPUCC_CX_GDSCR));
++			goto out;
++		}
++		(void)gpu_branch_on(g_cc, GPUCC_AHB, false);
++		(void)gpu_branch_on(g_cc, GPUCC_CXO, true);
++		(void)gpu_branch_on(g_cc, GPUCC_CX_GMU, true);
++		(void)gpu_branch_on(g_cc, GPUCC_CX_APB, true);
++		(void)gpu_branch_on(g_cc, GPUCC_CX_SNOC_DVM, true);
++		gpu_report("CX powered");
++	}
++	if (!gpu_gmu_readable()) {
++		printf("SWEET GPU: CX/GMU clocks off; GMU not read\n");
++		goto out;
++	}
++	g_gmu = ml_io_map(GMU_PA, GMU_SIZE);
++	if (!g_gmu) {
++		printf("SWEET GPU: GMU map failed\n");
++		goto out;
++	}
++	printf("SWEET GPU: GMU cm3-reset 0x%08x fw-init 0x%08x hfi 0x%08x general7 0x%08x\n",
++	    gpu_rd(g_gmu, GMU_CM3_SYSRESET), gpu_rd(g_gmu, GMU_CM3_FW_INIT_RESULT),
++	    gpu_rd(g_gmu, GMU_HFI_CTRL_STATUS), gpu_rd(g_gmu, GMU_GENERAL_7));
++	printf("SWEET GPU: GMU sptprac 0x%08x cx-rpmh 0x%08x ao-int 0x%08x; stage 0 done\n",
++	    gpu_rd(g_gmu, GMU_SPTPRAC_PWR_CLK), gpu_rd(g_gmu, GMU_CX_RPMH_POWER_STATE),
++	    gpu_rd(g_gmu, GMU_AO_HOST_INT_STATUS));
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_gpu_init(void)
++{
++	int mode = 0;
++	thread_t thread;
++	(void)PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode));
++	if (mode <= 0) {
++		return;
++	}
++	if (kernel_thread_start(gpu_thread, (void *)(uintptr_t)mode, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --color -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-06 00:28:46.046949317 +0100
++++ b/bsd/dev/sweet_ufs.c	2026-11-06 00:28:46.056103641 +0100
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_init();
+ 	return 0;
+ }
+ 
