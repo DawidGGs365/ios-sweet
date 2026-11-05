@@ -36,6 +36,9 @@ codesign -f -s - --entitlements flame/oslog-ents.plist out/oslog
 build netsvc flame/netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
 codesign -f -s - --entitlements flame/netsvc-ents.plist out/netsvc
 build nettest flame/nettest.m -fobjc-arc -framework Foundation
+# a network service for en0 (preferences.plist from before 0139 has none)
+build wifisvc wifisvc/wifisvc.c -framework CoreFoundation -framework SystemConfiguration
+codesign -f -s - --entitlements wifisvc/entitlements.plist out/wifisvc
 # G3: needs userland/mesa/mk-mesa.sh first (libOSMesa.8.dylib + headers)
 MESA=mesa/build
 if [ -f $MESA/out/libOSMesa.8.dylib ]; then

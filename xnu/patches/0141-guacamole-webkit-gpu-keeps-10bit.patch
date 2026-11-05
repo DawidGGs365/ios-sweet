@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 3aec0e498..fd9a8b781 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -311,9 +311,18 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	static int keep10 = -1;
+ 	if (keep10 < 0) {
+ 		int v = 0;
+-		keep10 = PE_parse_boot_argn("sweetsurf10", &v, sizeof(v)) && v != 0;
++		keep10 = PE_parse_boot_argn("sweetsurf10", &v, sizeof(v)) ? v : 0;
+ 	}
+-	if (!keep10) {
++	/*
++	 * 0141: sweetsurf10=3 keeps the 10-bit formats for WebKit's GPU process only. It draws
++	 * Safari's page tiles ('w30r', 'b3a8') and leaves every remapped one empty (0140, wifi27/29:
++	 * "pixels set 0"), while the BGRA surfaces it asks for get pixels.
++	 */
++	char who10[32] = "";
++	if (keep10 == 3) {
++		proc_selfname(who10, sizeof(who10));
++	}
++	if (keep10 == 0 || (keep10 == 3 && strcmp(who10, "com.apple.WebKit.GPU") != 0)) {
+ 		if (s->pixelFormat == 0x77333072u || s->pixelFormat == 0x6C313072u ||
+ 		    s->pixelFormat == 0x77333052u) {
+ 			s->pixelFormat = 0x42475241u;           /* 'BGRA' */

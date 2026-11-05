@@ -1,0 +1,87 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0cf51fd76..3aec0e498 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -522,6 +522,54 @@ sweet_surf_watch(const char *what, SweetSurface *s, uint64_t extra)
+ 	}
+ }
+ 
++/*
++ * 0140: Safari's page area stays black (wifi25/26) while its own UI draws. Who in WebKit makes
++ * which surfaces, who maps them later (backboardd? MobileSafari?), and whether WebContent's
++ * pixels are there when it unlocks: at most 240 lines. The first 64 creates of the boot are
++ * all logged anyway, WebKit's processes start after them.
++ */
++static uint32_t sweet_wk_ids[64];
++static uint32_t sweet_wk_n, sweet_wk_lines;
++
++static bool
++sweet_wk_proc(char *name, size_t len)
++{
++	proc_selfname(name, (int)len);
++	return strncmp(name, "com.apple.WebKit", 16) == 0 || strcmp(name, "MobileSafari") == 0;
++}
++
++static void
++sweet_wk_log(const char *what, SweetSurface *s, IOReturn ret)
++{
++	char name[32];
++	bool wk = sweet_wk_proc(name, sizeof(name));
++	bool known = false;
++	for (uint32_t i = 0; s != NULL && i < sweet_wk_n && i < 64; i++) {
++		known |= sweet_wk_ids[i] == s->id;
++	}
++	if ((!wk && !known) || s == NULL || sweet_wk_lines >= 240) {
++		return;
++	}
++	if (wk && !known && strcmp(what, "create") == 0 && sweet_wk_n < 64) {
++		sweet_wk_ids[sweet_wk_n++] = s->id;
++	}
++	uint64_t set = 0, size = 0;
++	if (strcmp(what, "unlock") == 0 && s->memory != NULL) {
++		size = (uint64_t)s->bytesPerRow * s->height;
++		const uint8_t *pixels = (const uint8_t *)s->kernelAddress();
++		if (pixels != NULL && size <= s->memory->getLength()) {
++			pixels += s->wrapDelta;
++			for (uint64_t i = 0; i < size; i += 4) {
++				set += *(const uint32_t *)(const void *)(pixels + i) != 0;
++			}
++		}
++	}
++	sweet_wk_lines++;
++	IOLog("SWEET SURF: wk %s %s id %u %ux%u fmt 0x%x bpr %u -> 0x%x%s pixels set %llu of %llu\n", name, what,
++	    s->id, s->width, s->height, s->pixelFormat, s->bytesPerRow, ret, known && !wk ? " (a WebKit surface)" : "",
++	    (unsigned long long)set, (unsigned long long)(size / 4));
++}
++
+ static void
+ sweet_surf_log_once(const char *what, uint32_t n)
+ {
+@@ -722,6 +770,7 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+ 		return ret;
+ 	}
+ 	sweet_surf_watch(existing ? "map (already)" : "map", s, ref->data->getAddress());
++	sweet_wk_log(existing ? "map (already)" : "map", s, kIOReturnSuccess);
+ 	uint8_t *out = (uint8_t *)IOMallocZeroData(SWEET_SURFACE_RESULT_SIZE);
+ 	if (out == NULL) {
+ 		ret = kIOReturnNoMemory;
+@@ -841,6 +890,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
++	char wkname[32];
++	if (sweet_wk_proc(wkname, sizeof(wkname)) && sweet_wk_lines < 240) {
++		IOLog("SWEET SURF: wk %s asked fmt 0x%x\n", wkname, sweet_dict_u32(props, "IOSurfacePixelFormat", 0));
++	}
++	sweet_wk_log("create", s, ret);
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+ 		s->release();
+@@ -1114,6 +1168,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	sweet_surf_watch("unlock", s, (uintptr_t)options);
++	sweet_wk_log("unlock", s, kIOReturnSuccess);
+ 	s->release();
+ 	return ret;
+ }

@@ -221,7 +221,16 @@ def build(seed=None, qemu=False, highmem=False):
         # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
         # otherwise crashes trying to set the PMU boot stage (customer builds
         # ignore the -wdt_no_pmu boot-arg).
-        node('wdt', [ph(), ('no-pmu', u32(1))]),
+        node('wdt', [ph(), ('no-pmu', u32(1))])] + ([
+        # --guacamole: launchd starts wifid only when the device tree has a
+        # "wlan" node (com.apple.wifid _LimitLoadToDeviceTree = wlan,
+        # marconi-wifi); the kernel's en0 + Apple80211 (0139, flame_wlan.c)
+        # answer it. As ios-flame's mkadt.py. Phone wifi27: no wifid without it.
+        node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('guacamole,wcn3990')),
+        ])] if GUACAMOLE else []) + [
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);

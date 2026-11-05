@@ -681,7 +681,10 @@ static int net(unsigned secs)
 			delay_ms(100);	/* topaz: only after mission mode; before it a CE access hangs the bus */
 			if (radio_start())
 				printf("net: radio start failed\n");
-			else if (bridge_open() != 0 && conf_ssid[0] && ipnet_init())
+			else if (bridge_open() == 0)
+				bridge_joins = 1;	/* guacamole: wifid joins (its saved networks); our own wlan.conf
+							 * join before it showed as an "insecure network" (wifi28) */
+			else if (conf_ssid[0] && ipnet_init())
 				printf("net: no utun: joining without IP\n");
 		}
 	}
