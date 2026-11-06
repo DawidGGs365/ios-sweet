@@ -1,0 +1,213 @@
+diff --color -ruN a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c	2026-11-06 13:46:57.249483459 +0100
++++ b/bsd/dev/sweet_keys.c	2026-11-06 13:48:20.937974172 +0100
+@@ -7,6 +7,14 @@
+  * PON RESIN to volume-down, so either source counts as volume-down there.
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ *
++ * guacamole alert slider (stock dtbo 18821 tri_state_key, OnePlus
++ * drivers/misc/tri_state_key/tri_state_key.c): TLMM gpio27 (key1, EAST),
++ * gpio134 (key2, SOUTH), gpio125 (key3, WEST), bias-disable, exactly one
++ * reads low: key3 = top (silent), key2 = middle (vibrate), key1 = bottom
++ * (ring). Reported to iOS as the ring/silent switch: top and middle are
++ * silent. TLMM is read only (IN_OUT bit 0); sweetslider=0 disables it,
++ * sweetslider=2 inverts the reported polarity.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -20,6 +28,8 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern bool sweet_hid_ringer(int ring);
++extern unsigned sweet_hid_button_clients(void);
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c440000u
+@@ -137,6 +147,64 @@
+ 	return ok;
+ }
+ 
++
++/* Alert slider: TLMM tile + 0x1000 * gpio; CTL at +0, IN_OUT at +4. */
++static struct {
++	uint32_t pa;
++	unsigned gpio;
++	vm_offset_t va;
++} slider_pin[3] = {
++	{ 0x03500000u + 0x1000u * 27u, 27, 0 },         /* key1 EAST: bottom (ring) */
++	{ 0x03d00000u + 0x1000u * 134u, 134, 0 },       /* key2 SOUTH: middle (vibrate) */
++	{ 0x03100000u + 0x1000u * 125u, 125, 0 },       /* key3 WEST: top (silent) */
++};
++static bool slider_ok, slider_invert;
++
++static void
++slider_init(void)
++{
++	int mode = 1;
++	(void)PE_parse_boot_argn("sweetslider", &mode, sizeof(mode));
++	if (!keys_guac || mode == 0) {
++		return;
++	}
++	slider_invert = mode == 2;
++	bool ok = true;
++	for (unsigned i = 0; i < 3; i++) {
++		slider_pin[i].va = ml_io_map(slider_pin[i].pa, 0x1000);
++		if (!slider_pin[i].va) {
++			ok = false;
++			continue;
++		}
++		uint32_t ctl = keys_rd(slider_pin[i].va, 0), io = keys_rd(slider_pin[i].va, 4);
++		/* CTL: [1:0] pull, [5:2] function (0 = GPIO), bit 9 output enable */
++		bool input = ((ctl >> 2) & 0xfu) == 0 && !(ctl & (1u << 9));
++		printf("SWEET SLIDER: gpio%u ctl %#x in %u -> %s\n", slider_pin[i].gpio, ctl, io & 1u,
++		    input ? "gpio input" : "NOT a gpio input; slider disabled");
++		ok = ok && input;
++	}
++	slider_ok = ok;
++}
++
++/* 0 ring (bottom), 1 vibrate (middle), 2 silent (top), -1 between positions. */
++static int
++slider_read(void)
++{
++	unsigned k1 = keys_rd(slider_pin[0].va, 4) & 1u;
++	unsigned k2 = keys_rd(slider_pin[1].va, 4) & 1u;
++	unsigned k3 = keys_rd(slider_pin[2].va, 4) & 1u;
++	if (k1 && k2 && !k3) {
++		return 2;
++	}
++	if (k1 && !k2 && k3) {
++		return 1;
++	}
++	if (!k1 && k2 && k3) {
++		return 0;
++	}
++	return -1;
++}
++
+ static void
+ keys_wait(void)
+ {
+@@ -151,9 +219,31 @@
+ {
+ 	int state[3] = {0, 0, 0};
+ 	unsigned errors = 0;
++	int sl_seen = -1, sl_stable = 0, sl_sent = -1;
++	unsigned sl_clients = 0;
++	static const char *const sl_names[] = { "ring", "vibrate", "silent" };
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
++		if (slider_ok) {
++			int pos = slider_read();
++			sl_stable = pos == sl_seen ? sl_stable + 1 : 0;
++			sl_seen = pos;
++			unsigned clients = sweet_hid_button_clients();
++			/* A new HID client (backboardd) missed earlier events: resend. */
++			bool resend = clients > sl_clients;
++			if (pos >= 0 && sl_stable >= 3 && (pos != sl_sent || resend)) {
++				int ring = (pos == 0) != slider_invert;
++				if (sweet_hid_ringer(ring)) {
++					printf("SWEET SLIDER: %s -> ringer %s (%u clients)\n", sl_names[pos],
++					    ring ? "on" : "silent", clients);
++					sl_sent = pos;
++					sl_clients = clients;
++				}
++			} else if (clients < sl_clients) {
++				sl_clients = clients;
++			}
++		}
+ 		uint8_t pon = 0, gpio = 0, gdn = 0xff;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 		bool gok = keys_read(keys_gpio[0].apid, keys_gpio[0].base + 0x10u, &gpio);
+@@ -234,6 +324,20 @@
+ 	if (!pok && !gok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
++	slider_init();
++	if (keys_guac) {
++		/*
++		 * Read-only haptics probe: PM8150B (SID 3) qcom,haptics @0xc000 vs the
++		 * AW8697 on SE7. TYPE 0x04 / SUBTYPE 0x05 / EN_CTL 0x46 / STATUS1 0x0a.
++		 */
++		uint16_t ha = keys_find_apid(0x3c0, count);
++		uint8_t ty = 0, st = 0, en = 0, s1 = 0;
++		bool hok = keys_read(ha, 0xc004u, &ty) && keys_read(ha, 0xc005u, &st);
++		(void)keys_read(ha, 0xc046u, &en);
++		(void)keys_read(ha, 0xc00au, &s1);
++		printf("SWEET HAPTICS: pm8150b@c000 apid %u type %#x subtype %#x en %#x status1 %#x read %d\n",
++		    ha, ty, st, en, s1, hok);
++	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --color -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-06 13:46:57.250743672 +0100
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-06 13:46:57.251465882 +0100
+@@ -329,7 +329,17 @@
+ 	OSDeclareDefaultStructors(SweetHIDButtons);
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	void key(UInt32 usage, bool down);
++	void key(UInt32 usage, bool down) { key(kHIDPage_Consumer, usage, down); }
++	void key(UInt32 page, UInt32 usage, bool down);
++	unsigned
++	clientCount()
++	{
++		/* _clients is replaced under _clientLock (copy on write). */
++		IOLockLock(_clientLock);
++		unsigned n = _clients ? _clients->getCount() : 0;
++		IOLockUnlock(_clientLock);
++		return n;
++	}
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
+@@ -400,12 +410,12 @@
+ }
+ 
+ void
+-SweetHIDButtons::key(UInt32 usage, bool down)
++SweetHIDButtons::key(UInt32 page, UInt32 usage, bool down)
+ {
+-	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), page, usage, down);
+ 
+ 	if (event) {
+-		IOLog("SWEET HID: key 0x%x %s (%u clients)\n", (unsigned)usage, down ? "down" : "up",
++		IOLog("SWEET HID: key %#x/0x%x %s (%u clients)\n", (unsigned)page, (unsigned)usage, down ? "down" : "up",
+ 		    _clients ? _clients->getCount() : 0);
+ 		dispatchEvent(event);
+ 		event->release();
+@@ -572,6 +582,29 @@
+ 	}
+ }
+ 
++/*
++ * Ring/silent switch. iOS takes it as Telephony/RingEnable keyboard events
++ * (IOHIDFamily HIDButtonLoggingServiceFilter lists the pair as the ringer).
++ * ring != 0: ringing enabled (key down); 0: silent (key up). Returns false
++ * while the HID service is not registered yet so the caller can retry.
++ */
++extern "C" bool
++sweet_hid_ringer(int ring)
++{
++	if (!gSweetButtons) {
++		return false;
++	}
++	gSweetButtons->key(kHIDPage_Telephony, kHIDUsage_Tfon_RingEnable, ring != 0);
++	return true;
++}
++
++/* Open HID event clients of the button service (0 before backboardd). */
++extern "C" unsigned
++sweet_hid_button_clients(void)
++{
++	return gSweetButtons ? gSweetButtons->clientCount() : 0;
++}
++
+ extern "C" void
+ sweet_hid_touch_panel(int w, int h)
+ {
