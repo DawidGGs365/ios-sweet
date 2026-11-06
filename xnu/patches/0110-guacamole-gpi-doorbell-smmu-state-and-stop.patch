@@ -1,0 +1,95 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 14:10:19.792587320 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 14:10:19.801349549 +0100
+@@ -375,6 +375,8 @@
+ 	uint64_t dva;                           /* device (IOVA) address of the buffer */
+ 	vm_offset_t pt_va;                      /* stage-1 tables: L1, L2, L3 */
+ 	vm_offset_t cb;                         /* apps-SMMU context bank registers */
++	vm_offset_t smmu;                       /* apps-SMMU global register space 0 */
++	unsigned doorbells;                     /* doorbells rung (sweetgpistop) */
+ 	uint64_t pt_pa;
+ 	uint32_t ev_rp, tx_wp, rx_wp;           /* byte offsets inside their rings */
+ 	bool pend;                              /* pointer write waiting for its read */
+@@ -531,6 +533,7 @@
+ 	bool ok = ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == cb && smr == ((1u << 31) | GPI_SID) &&
+ 	    ((cbar >> 16) & 3u) == 1u && (sctlr & 1u) && touch_rd(cbr, 0x20) == (uint32_t)gpi.pt_pa;
+ 	gpi.cb = cbr;
++	gpi.smmu = smmu;
+ 	touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x smr%u %#x s2cr %#x -> cb%u cbar %#x sctlr %#x ttbr 0x%llx iova %#x: %s\n",
+ 	    scr0, idx, smr, s2cr, cb, cbar, sctlr, gpi.pt_pa, GPI_IOVA, ok ? "S1 translation" : "REJECTED, no DMA");
+ 	if (!ok) {
+@@ -789,6 +792,43 @@
+ 	return ETIMEDOUT;
+ }
+ 
++/*
++ * 0110: s0105's first S1-translated DMA sent the SoC to crash-dump (EDL)
++ * with nothing logged. While probing, every doorbell is preceded by the
++ * SMMU fault state and a pause so the line leaves over USB before a
++ * possible fatal fault, and followed by the same state. Boot-arg
++ * sweetgpistop: 1 never rings a doorbell, 2 only the first one.
++ */
++static void
++gpi_smmu_state(const char *when)
++{
++	if (!st.probing || !gpi.cb || !gpi.smmu) {
++		return;
++	}
++	touch_log("SWEET TOUCH: GPI %s: gfsr %#x gfsynr0 %#x cb fsr %#x far 0x%08x%08x fsynr0 %#x err-log %#x\n", when,
++	    touch_rd(gpi.smmu, 0x48), touch_rd(gpi.smmu, 0x50), touch_rd(gpi.cb, 0x58),
++	    touch_rd(gpi.cb, 0x64), touch_rd(gpi.cb, 0x60), touch_rd(gpi.cb, 0x68),
++	    touch_rd(gpi.regs, GPI_ERROR_LOG));
++}
++
++static bool
++gpi_doorbell_allowed(const char *what)
++{
++	unsigned stop = 0;
++	(void)PE_parse_boot_argn("sweetgpistop", &stop, sizeof(stop));
++	if ((stop == 1) || (stop == 2 && gpi.doorbells >= 1)) {
++		touch_log("SWEET TOUCH: GPI sweetgpistop=%u: not ringing %s\n", stop, what);
++		return false;
++	}
++	if (st.probing && gpi.doorbells < 4) {
++		touch_log("SWEET TOUCH: GPI about to ring %s (doorbell %u)\n", what, gpi.doorbells + 1);
++		gpi_smmu_state("before doorbell");
++		delay(300000);                  /* let the USB log send these lines */
++	}
++	gpi.doorbells++;
++	return true;
++}
++
+ /* 400 kHz from 19.2 MHz (Linux geni_i2c_clk_map): div 2, high 5, low 12, cycle 24, TX/RX packing. */
+ #define GPI_I2C_CONFIG0         (12u | (5u << 8) | (24u << 16) | (1u << 24) | (1u << 25))
+ 
+@@ -802,10 +842,15 @@
+ 	    TRE_GO | TRE_CHAIN);    /* downstream i2c-qcom-geni: write GO rx_len 0 */
+ 	gpi_queue(0, (uint32_t)(gpi.dva + GB_TXBUF), (uint32_t)((gpi.dva + GB_TXBUF) >> 32), nt, TRE_DMA | TRE_IEOT);
+ 	gpi_chk("before-tx-db");
++	if (!gpi_doorbell_allowed("tx (write phase)")) {
++		return ENXIO;
++	}
+ 	gpi_ring(0);
+ 	delay(200);
+ 	gpi_chk("tx-db+200us");
+-	return gpi_wait(0);
++	int err = gpi_wait(0);
++	gpi_smmu_state(err ? "after write phase (error)" : "after write phase");
++	return err;
+ }
+ 
+ static int
+@@ -814,9 +859,13 @@
+ 	gpi_sync(GB_RXBUF, (nr + 63u) & ~63u);
+ 	gpi_queue(1, (uint32_t)(gpi.dva + GB_RXBUF), (uint32_t)((gpi.dva + GB_RXBUF) >> 32), nr, TRE_DMA | TRE_IEOT);
+ 	gpi_queue(0, GPI_I2C_READ | ((uint32_t)addr << 8), 0, nr, TRE_GO | TRE_LINK | (1u << 8)); /* + IEOB */
++	if (!gpi_doorbell_allowed("rx+tx (read phase)")) {
++		return ENXIO;
++	}
+ 	gpi_ring(1);
+ 	gpi_ring(0);
+ 	int err = gpi_wait(1);
++	gpi_smmu_state(err ? "after read phase (error)" : "after read phase");
+ 	if (!err) {
+ 		gpi_sync(GB_RXBUF, (nr + 63u) & ~63u);
+ 		memcpy(rx, (const void *)(gpi.va + GB_RXBUF), nr);
