@@ -1,0 +1,307 @@
+diff --color -ruN a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c	2026-11-06 13:53:43.881195137 +0100
++++ b/bsd/dev/sweet_gpu.c	2026-11-06 13:54:30.976726606 +0100
+@@ -14,7 +14,8 @@
+  * Addresses: DT qcom,gpucc (gpucc-sm8150.c), qcom,gmu@0x2C6A000; GMU
+  * registers are dword offsets (a6xx_gmu.xml.h) from 0x2c6a000.
+  * Boot-arg sweetgpu: 0 off (default), 1 read state only, 2 also power CX,
+- * 3 also boot the GMU firmware (stage 1, below).
++ * 3 also boot the GMU firmware (stage 1, below), 4 also send the HFI
++ * perf/bandwidth tables and CORE_FW_START (stage 1b).
+  * Runs in its own thread after sweetgpudelay seconds (default 60).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -31,6 +32,9 @@
+ #include <arm/caches_internal.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_rpmh_gpu_arcs(uint16_t gfx[16], unsigned *ngfx, uint16_t cx[16], unsigned *ncx,
++    uint16_t mx[16], unsigned *nmx);
++static int g_mode;
+ extern kern_return_t thread_terminate(thread_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ void sweet_gpu_init(void);
+@@ -647,6 +651,156 @@
+ 	return n_tcm > 0;
+ }
+ 
++/*
++ * Stage 1b: KGSL S_12.1 hfi_start after FW_VER (a640, HFI v2):
++ * PERF_TBL, BW_VOTE_TBL, FEATURE_CTRL(ECP off), CORE_FW_START, then
++ * H2F_MSG_START like mainline a6xx_hfi_start.
++ *
++ * GPU levels: stock GM1913 dtb0 (SM8150 v2) qcom,gpu-pwrlevels-<bin> with
++ * gpu_opp_table_v2 opp-microvolt (RPMh VLVL + 1); bin from the qfprom fuse
++ * qcom,gpu-speed-bin <0x4130 0xe0000000 29> (qfprom_memory 0x780000).
++ * GMU levels: 0 and 200 MHz at VDD_MIN (MIN_SVS 48, gpucc-sm8150 rate_max).
++ * Votes: kgsl_gmu.c setup_volt_dependency_tbl over cmd-db gfx/cx/mx.lvl.
++ * Bandwidth: mainline a640_build_bw_table (single "off" DDR level, fixed
++ * CNOC votes); real bus scaling comes later.
++ */
++#define QFPROM_PA               0x00784000u
++#define GPU_SPEED_BIN_OFF       0x130u          /* 0x780000 + 0x4130 */
++#define HFI_PERF_TBL            4u
++#define HFI_BW_TBL              3u
++#define HFI_FEATURE_CTRL        11u
++#define HFI_CORE_FW_START       14u
++#define HFI_START               10u
++
++static const struct { unsigned n; uint32_t hz[7]; uint16_t vlvl[7]; } gpu_bins[2] = {
++	/* DT order, fastest first; the last level is the 0 Hz "off" level */
++	{ 6, { 585000000, 499200000, 427000000, 345000000, 257000000, 0 },
++	  { 0x100, 0xe0, 0xc0, 0x80, 0x40, 0 } },
++	{ 7, { 675000000, 585000000, 499200000, 427000000, 345000000, 257000000, 0 },
++	  { 0x140, 0x100, 0xe0, 0xc0, 0x80, 0x40, 0 } },
++};
++
++/* ARC_VOTE_SET(pri index, sec index, vlvl); false when vlvl has no primary level. */
++static bool
++gm_arc_vote(const uint16_t *pri, unsigned npri, const uint16_t *sec, unsigned nsec,
++    unsigned vlvl, uint32_t *vote)
++{
++	unsigned k, j;
++	for (k = 0; k < npri && pri[k] < vlvl; k++) {
++	}
++	if (k == npri) {
++		return false;
++	}
++	unsigned cur = pri[k];
++	for (j = 0; j < nsec; j++) {
++		if (sec[j] >= cur || j + 1 == nsec) {
++			break;
++		}
++	}
++	if (j == nsec) {
++		j = 0;
++	}
++	*vote = ((cur & 0xffffu) << 16) | ((j & 0xffu) << 8) | (k & 0xffu);
++	return true;
++}
++
++/* Send one HFI command; true when the GMU ACKed it with error 0. */
++static bool
++gm_hfi_req(const char *name, uint32_t *cmd, unsigned ndw)
++{
++	uint32_t ack[8] = { 0 };
++	int n = gm_hfi_cmd(cmd, ndw, ack, 8);
++	bool ok = n >= 3 && ack[2] == 0;
++	printf("SWEET GPU: S1b %s (%u dw): %s ack %d err %#x\n", name, ndw, ok ? "OK" : "FAILED", n,
++	    n >= 3 ? ack[2] : 0);
++	return ok;
++}
++
++static void
++gpu_stage1b(void)
++{
++	vm_offset_t qf = ml_io_map(QFPROM_PA, 0x1000);
++	if (!qf) {
++		return;
++	}
++	uint32_t fuse = gpu_rd(qf, GPU_SPEED_BIN_OFF);
++	unsigned bin = (fuse & 0xe0000000u) >> 29;
++	if (bin >= 2) {
++		printf("SWEET GPU: S1b speed bin %u (fuse %#x) has no stock pwrlevels; stop\n", bin, fuse);
++		return;
++	}
++	uint16_t gfx[16], cx[16], mx[16];
++	unsigned ngfx = 0, ncx = 0, nmx = 0;
++	int err = sweet_rpmh_gpu_arcs(gfx, &ngfx, cx, &ncx, mx, &nmx);
++	if (err) {
++		printf("SWEET GPU: S1b cmd-db ARC tables unavailable (errno %d); stop\n", err);
++		return;
++	}
++	static uint32_t perf[59];
++	memset(perf, 0, sizeof(perf));
++	unsigned n = gpu_bins[bin].n;
++	perf[0] = (59u << 8) | HFI_PERF_TBL;
++	perf[1] = n;
++	perf[2] = 2;
++	for (unsigned i = 0; i < n; i++) {
++		unsigned d = n - 1 - i;                         /* gmu->gpu_freqs: slowest first */
++		uint32_t *gx = &perf[3 + 3 * i];
++		if (!gm_arc_vote(gfx, ngfx, mx, nmx, gpu_bins[bin].vlvl[d], &gx[0])) {
++			printf("SWEET GPU: S1b gpu vlvl %#x not in gfx.lvl; stop\n", gpu_bins[bin].vlvl[d]);
++			return;
++		}
++		gx[1] = 0xffffffffu;                            /* acd: unused threshold */
++		gx[2] = gpu_bins[bin].hz[d] / 1000u;
++	}
++	static const unsigned gmu_hz[2] = { 0, 200000000 }, gmu_vlvl[2] = { 0, 48 };
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t *c = &perf[3 + 3 * 16 + 2 * i];
++		if (!gm_arc_vote(cx, ncx, mx, nmx, gmu_vlvl[i], &c[0])) {
++			printf("SWEET GPU: S1b gmu vlvl %u not in cx.lvl; stop\n", gmu_vlvl[i]);
++			return;
++		}
++		c[1] = gmu_hz[i] / 1000u;
++	}
++	printf("SWEET GPU: S1b speed bin %u: gx votes", bin);
++	for (unsigned i = 0; i < n; i++) {
++		printf(" %u:%#x", perf[3 + 3 * i + 2], perf[3 + 3 * i]);
++	}
++	printf("; cx %#x %#x\n", perf[51], perf[53]);
++	if (!gm_hfi_req("PERF_TBL", perf, 59)) {
++		return;
++	}
++	/* hfi_bwtable_cmd: 6 + cnoc addrs[6] + cnoc data[2][6] + ddr addrs[8] + ddr data[16][8] */
++	static uint32_t bw[160];
++	memset(bw, 0, sizeof(bw));
++	bw[0] = (160u << 8) | HFI_BW_TBL;
++	bw[1] = 1;                                              /* bw_level_num */
++	bw[2] = 3;                                              /* cnoc_cmds_num */
++	bw[3] = 3;                                              /* ddr_cmds_num */
++	bw[4] = 1;                                              /* cnoc_wait_bitmask */
++	bw[5] = 1;                                              /* ddr_wait_bitmask */
++	uint32_t *cna = &bw[6], *cnd = &bw[12], *dda = &bw[24], *ddd = &bw[32];
++	cna[0] = 0x50034; cna[1] = 0x5007c; cna[2] = 0x5004c;
++	cnd[0] = 0x40000000; cnd[1] = 0x00000000; cnd[2] = 0x40000000;
++	cnd[6] = 0x60000001; cnd[7] = 0x20000001; cnd[8] = 0x60000001;
++	dda[0] = 0x50000; dda[1] = 0x5003c; dda[2] = 0x5000c;
++	ddd[0] = 0x40000000; ddd[1] = 0x40000000; ddd[2] = 0x40000000;
++	if (!gm_hfi_req("BW_VOTE_TBL", bw, 160)) {
++		return;
++	}
++	uint32_t ecp[4] = { (4u << 8) | HFI_FEATURE_CTRL, 1u /* HFI_FEATURE_ECP */, 0, 0 };
++	if (!gm_hfi_req("FEATURE_CTRL ECP off", ecp, 4)) {
++		return;
++	}
++	uint32_t fw[2] = { (2u << 8) | HFI_CORE_FW_START, 0 };
++	if (!gm_hfi_req("CORE_FW_START", fw, 2)) {
++		return;
++	}
++	uint32_t st[1] = { (1u << 8) | HFI_START };
++	(void)gm_hfi_req("START", st, 1);
++	gm_smmu_fault_report("after stage 1b");
++	printf("SWEET GPU: S1b GMU rpmh-state 0x%08x; stage 1b done\n", gpu_rd(g_gmu, GMU_CX_RPMH_POWER_STATE));
++}
++
+ static void
+ gpu_stage1(void)
+ {
+@@ -741,6 +895,9 @@
+ 	    hfi_ver, n > 0 ? "ACKED" : "no ack", n, ack[2], ack[3], ack[3] >> 28, (ack[3] >> 16) & 0xfffu, ack[3] & 0xffffu);
+ 	gm_smmu_fault_report("after FW_VER");
+ 	printf("SWEET GPU: stage 1 done\n");
++	if (g_mode >= 4 && n >= 3 && ack[2] == 0) {
++		gpu_stage1b();
++	}
+ }
+ 
+ /* The GMU block is only safe to read with CX powered and the GMU/AHB clocks running. */
+@@ -756,6 +913,7 @@
+ gpu_thread(void *arg, wait_result_t result)
+ {
+ 	int mode = (int)(uintptr_t)arg;
++	g_mode = mode;
+ 	unsigned delay_s = 60;
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("sweetgpudelay", &delay_s, sizeof(delay_s));
+diff --color -ruN a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c	2026-11-06 13:53:43.881179502 +0100
++++ b/bsd/dev/sweet_rpmh.c	2026-11-06 13:53:43.892703449 +0100
+@@ -13,6 +13,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_bcm_vote(const char *res, uint32_t vote_x, uint32_t vote_y);
++int sweet_rpmh_gpu_arcs(uint16_t gfx[16], unsigned *ngfx, uint16_t cx[16], unsigned *ncx,
++    uint16_t mx[16], unsigned *nmx);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -44,6 +46,7 @@
+ #define RH_DB_HEADER    144u
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
++#define RH_ARC          3u
+ #define RH_VRM          4u
+ #define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
+@@ -53,6 +56,7 @@
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+ static bool rh_poisoned;
++static uint32_t rh_aux_off, rh_aux_len;   /* aux data of the last rh_lookup match */
+ 
+ static uint32_t
+ rh_read(vm_offset_t base, uint32_t off)
+@@ -194,6 +198,8 @@
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
++			rh_aux_off = aux + rh_db16(e + 22);
++			rh_aux_len = rh_db16(e + 20);
+ 			++matches;
+ 			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+ 			    res, addr, slave, rh_db16(h + 8),
+@@ -427,5 +433,71 @@
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++
++/*
++ * KGSL rpmh_arc_cmds(): an ARC resource's aux data is a zero-padded table
++ * of little-endian u16 voltage levels (VLVL); count up to the padding.
++ * Read only: no TCS is touched.
++ */
++static int
++rh_arc_levels(const char *res, uint16_t vals[16], unsigned *count)
++{
++	uint32_t address = 0;
++	int error = rh_lookup(res, RH_ARC, &address);
++	if (error) {
++		return error;
++	}
++	unsigned n = rh_aux_len / 2u;
++	if (n == 0 || n > 16) {
++		printf("SWEET RPMH: %s aux len %u unsupported\n", res, rh_aux_len);
++		return EINVAL;
++	}
++	for (unsigned i = 0; i < 16; i++) {
++		vals[i] = i < n ? rh_db16(rh_aux_off + 2u * i) : 0;
++	}
++	unsigned num;
++	for (num = 1; num < n; num++) {
++		if (vals[num - 1] != 0 && vals[num] == 0) {
++			break;
++		}
++	}
++	*count = num;
++	printf("SWEET RPMH: %s %u levels:", res, num);
++	for (unsigned i = 0; i < num; i++) {
++		printf(" %u", vals[i]);
++	}
++	printf("\n");
++	return 0;
++}
++
++/* gfx.lvl / cx.lvl / mx.lvl for the GMU perf table; also logs the a640 BW BCMs. */
++int
++sweet_rpmh_gpu_arcs(uint16_t gfx[16], unsigned *ngfx, uint16_t cx[16], unsigned *ncx,
++    uint16_t mx[16], unsigned *nmx)
++{
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_poisoned ? EIO : rh_map();
++	if (!error) {
++		error = rh_arc_levels("gfx.lvl", gfx, ngfx);
++	}
++	if (!error) {
++		error = rh_arc_levels("cx.lvl", cx, ncx);
++	}
++	if (!error) {
++		error = rh_arc_levels("mx.lvl", mx, nmx);
++	}
++	if (!error) {
++		/* Cross-check mainline a640_build_bw_table's fixed BCM addresses. */
++		static const char *const bcm[] = { "ACV", "MC0", "SH0", "CN0", "QUP0", "SN11" };
++		for (unsigned i = 0; i < sizeof(bcm) / sizeof(bcm[0]); i++) {
++			uint32_t a = 0;
++			(void)rh_lookup(bcm[i], RH_BCM, &a);
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
