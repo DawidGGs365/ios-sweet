@@ -1,0 +1,643 @@
+diff --color -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_gfg.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --color -ruN a/bsd/dev/sweet_gfg.c b/bsd/dev/sweet_gfg.c
+--- a/bsd/dev/sweet_gfg.c	1970-01-01 01:00:00.000000000 +0100
++++ b/bsd/dev/sweet_gfg.c	2026-11-06 13:14:00.852672037 +0100
+@@ -0,0 +1,433 @@
++/*
++ * guacamole (OnePlus 7 Pro GM1913) battery fuel gauge: TI bq27541 at I2C
++ * 0x55 on QUP SE8 (0xa80000 = wrapper 1 SE0), SDA/SCL gpio88/89 (NORTH,
++ * function qup8 = 2). Source: stock dtbo project 18821 fragment@69 and
++ * OnePlus drivers/power/oplus/gauge_ic/oplus_bq27541.{c,h}.
++ *
++ * Only standard read commands are used (no subcommands, no writes to the
++ * gauge). The VOOC MCU (stm8s @0x26) on the same bus is never addressed.
++ * The I2C engine is the FIFO path of sweet_touch.c, reduced to one master.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "sweet_gfg.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_rpmh_bcm_vote(const char *res, uint32_t vote_x, uint32_t vote_y);
++
++#define GFG_GCC_PA      0x00100000u
++#define GFG_GCC_VOTE    0x5200cu        /* wrap1 m_ahb bit 20, s_ahb bit 21, s0 bit 22 */
++#define GFG_VOTE_MASK   ((1u << 20) | (1u << 21) | (1u << 22))
++#define GFG_RCG         0x18148u        /* gcc_qupv3_wrap1_s0_clk_src */
++#define GFG_NORTH_PA    0x03900000u     /* TLMM + NORTH tile */
++#define GFG_SE_PA       0x00a80000u
++#define GFG_SDA         88u
++#define GFG_SCL         89u
++#define GFG_ADDR        0x55u
++
++/* GENI SE registers (same layout as sweet_touch.c) */
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SCL          0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_TX_WM        0x80cu
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_DONE         (1u << 0)
++#define SE_NACK         (1u << 10)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
++	                 (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++/* bq27541 standard commands (little-endian 16-bit) */
++#define BQ_TEMP         0x06u   /* 0.1 K */
++#define BQ_VOLT         0x08u   /* mV */
++#define BQ_FLAGS        0x0au   /* bit0 DSG, bit9 FC */
++#define BQ_RM           0x10u   /* mAh */
++#define BQ_FCC          0x12u   /* mAh */
++#define BQ_AI           0x14u   /* mA, signed, positive = charging */
++#define BQ_CC           0x2au   /* cycle count */
++#define BQ_SOC          0x2cu   /* % */
++
++static vm_offset_t g_gcc, g_tlmm, g_se;
++static bool g_ready, g_dead;
++static unsigned g_level;
++
++static uint32_t
++gfg_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gfg_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool
++gfg_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(gfg_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++gfg_is_guacamole(void)
++{
++	DTEntry root;
++	void const *prop;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
++		return false;
++	}
++	const char *c = (const char *)prop;
++	for (unsigned int i = 0; i < size;) {
++		unsigned int n = 0;
++		while (i + n < size && c[i + n] != '\0') {
++			n++;
++		}
++		if (n == sizeof("oneplus,guacamole") - 1 && strncmp(c + i, "oneplus,guacamole", n) == 0) {
++			return true;
++		}
++		i += n + 1;
++	}
++	return false;
++}
++
++static bool
++gfg_clocks(void)
++{
++	gfg_wr(g_gcc, GFG_GCC_VOTE, gfg_rd(g_gcc, GFG_GCC_VOTE) | GFG_VOTE_MASK);
++	uint32_t dfs = gfg_rd(g_gcc, GFG_RCG + 0x14u);
++	if (dfs & 1u) {
++		/* DFS: pick the XO / div 1 level (19.2 MHz), never edit the table. */
++		for (unsigned level = 0; level < 8; ++level) {
++			if ((gfg_rd(g_gcc, GFG_RCG + 0x1cu + 4u * level) & 0x371fu) == 1u) {
++				g_level = level;
++				printf("SWEET GFG: SE8 DFS XO level %u\n", level);
++				goto branches;
++			}
++		}
++		printf("SWEET GFG: SE8 DFS without an XO level\n");
++		return false;
++	} else {
++		uint32_t cfg = gfg_rd(g_gcc, GFG_RCG + 4u);
++		gfg_wr(g_gcc, GFG_RCG + 4u, (cfg & ~(0x371fu | (1u << 20))) | 1u);
++		gfg_wr(g_gcc, GFG_RCG, gfg_rd(g_gcc, GFG_RCG) | 1u);
++		if (!gfg_wait_clear(g_gcc, GFG_RCG, 1u)) {
++			printf("SWEET GFG: SE8 RCG update timeout\n");
++			return false;
++		}
++	}
++branches:;
++	static const uint32_t branch[] = { 0x18004, 0x18008, 0x18144 };
++	for (unsigned i = 0; i < sizeof(branch) / sizeof(branch[0]); ++i) {
++		/* No halt check in hardware clock-gating mode (CBCR bit 1). */
++		if (gfg_rd(g_gcc, branch[i]) & (1u << 1)) {
++			continue;
++		}
++		if (!gfg_wait_clear(g_gcc, branch[i], 1u << 31)) {
++			printf("SWEET GFG: GCC branch %#x halted (%#x)\n", branch[i], gfg_rd(g_gcc, branch[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++gfg_pin(unsigned pin)
++{
++	/* function qup8 (2), no pull (DT bias-disable), 2 mA ((2/2)-1 = 0), input. */
++	uint32_t off = pin * 0x1000u;
++	uint32_t cfg = gfg_rd(g_tlmm, off);
++	cfg &= ~0x3ffu;
++	cfg |= (2u << 2);
++	gfg_wr(g_tlmm, off, cfg);
++}
++
++static void
++gfg_abort(void)
++{
++	gfg_wr(g_se, SE_CTRL, 2);
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (gfg_rd(g_se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || !gfg_wait_clear(g_se, SE_STATUS, 1u)) {
++		g_dead = true;
++		printf("SWEET GFG: abort failed status=%#x irq=%#x; gauge disabled\n",
++		    gfg_rd(g_se, SE_STATUS), gfg_rd(g_se, SE_IRQ));
++	}
++	for (unsigned i = 0; i < 64 && (gfg_rd(g_se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)gfg_rd(g_se, SE_RX);
++	}
++	gfg_wr(g_se, SE_IRQ_CLR, 0xffffffffu);
++}
++
++/* One FIFO I2C message: either a write of 1..3 bytes or a read of 1..8 bytes. */
++static int
++gfg_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	unsigned sent = 0, got = 0;
++	if (g_dead || nt > 3 || nr > 8 || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!gfg_wait_clear(g_se, SE_STATUS, 1u)) {
++		return EBUSY;
++	}
++	gfg_wr(g_se, SE_IRQ_CLR, 0xffffffffu);
++	gfg_wr(g_se, SE_TX_WM, nt ? 1u : 0u);
++	gfg_wr(g_se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	gfg_wr(g_se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)GFG_ADDR << 9) | (stretch ? 4u : 0u));
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = gfg_rd(g_se, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = gfg_rd(g_se, SE_IRQ);
++			}
++			if ((irq & SE_DONE) && !(gfg_rd(g_se, SE_STATUS) & 1u) &&
++			    !(gfg_rd(g_se, SE_TX_COUNT) & 0xfffffffu) &&
++			    !(gfg_rd(g_se, SE_RX_COUNT) & 0x1ffffffu)) {
++				gfg_wr(g_se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			gfg_wr(g_se, SE_TX, word);
++			sent = nt;
++			gfg_wr(g_se, SE_TX_WM, 0);
++		}
++		uint32_t count = gfg_rd(g_se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 64 || count > (nr - got + 3u) / 4u) {
++			err = EIO;
++			break;
++		}
++		while (count--) {
++			uint32_t word = gfg_rd(g_se, SE_RX);
++			for (unsigned j = 0; j < 4 && got < nr; ++j) {
++				rx[got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			irq = gfg_rd(g_se, SE_IRQ);
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			gfg_wr(g_se, SE_IRQ_CLR, irq);
++			if (got == nr && sent == nt) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		gfg_wr(g_se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	gfg_abort();
++	return err;
++}
++
++/* bq27541 standard command: pointer write (stretched) + 2-byte read. */
++static int
++gfg_word(uint8_t reg, uint16_t *out)
++{
++	uint8_t buf[2];
++	int err = gfg_msg(&reg, 1, NULL, 0, true);
++	if (!err) {
++		err = gfg_msg(NULL, 0, buf, 2, false);
++	}
++	if (!err) {
++		*out = (uint16_t)(buf[0] | ((uint16_t)buf[1] << 8));
++	}
++	return err;
++}
++
++static bool
++gfg_se_init(void)
++{
++	uint32_t fw = gfg_rd(g_se, SE_FW), ifdis = gfg_rd(g_se, 0x64);
++	uint32_t tx = gfg_rd(g_se, SE_HW_TX), rx = gfg_rd(g_se, SE_HW_RX);
++	printf("SWEET GFG: SE8 fw=%#x proto=%u ifdis=%#x status=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, ifdis, gfg_rd(g_se, SE_STATUS), tx, rx);
++	if (((fw >> 8) & 0xffu) != 3u) {
++		printf("SWEET GFG: SE8 not loaded with I2C firmware\n");
++		return false;
++	}
++	if (ifdis & 1u) {
++		printf("SWEET GFG: SE8 FIFO interface disabled (GSI only); gauge not supported yet\n");
++		return false;
++	}
++	if (gfg_rd(g_se, SE_STATUS) & 0x1001u) {
++		printf("SWEET GFG: SE8 busy; not touched\n");
++		return false;
++	}
++	gfg_wr(g_se, 0xe18, 0);         /* no GSI events */
++	gfg_wr(g_se, 0xe1c, 0);         /* polled */
++	gfg_wr(g_se, 0x644, 0);
++	gfg_wr(g_se, SE_IRQ_CLR, 0xffffffffu);
++	gfg_wr(g_se, 0x648, 0xffffffffu);
++	gfg_wr(g_se, SE_DMA, 0);
++	gfg_wr(g_se, 0x28, gfg_rd(g_se, 0x28) | 0x7fu);
++	gfg_wr(g_se, 0xe30, gfg_rd(g_se, 0xe30) | 0x0fu);
++	gfg_wr(g_se, 0x24, 0x7f);
++	gfg_wr(g_se, 0x20, 1);
++	gfg_wr(g_se, SE_CLK_SEL, g_level);
++	gfg_wr(g_se, SE_MCLK, (7u << 4) | 1u);
++	gfg_wr(g_se, SE_SCL, (10u << 20) | (11u << 10) | 26u);   /* 100 kHz from 19.2 MHz */
++	gfg_wr(g_se, 0x254, 0);
++	gfg_wr(g_se, 0x260, SE_PACK0);
++	gfg_wr(g_se, 0x264, SE_PACK1);
++	gfg_wr(g_se, 0x284, SE_PACK0);
++	gfg_wr(g_se, 0x288, SE_PACK1);
++	gfg_wr(g_se, SE_TX_WM, 0);
++	gfg_wr(g_se, 0x810, 0);
++	gfg_wr(g_se, 0x814, ((rx >> 16) & 0x3fu) ? ((rx >> 16) & 0x3fu) - 1u : 0u);
++	gfg_wr(g_se, SE_IRQ_EN, SE_EVENTS);
++	if (gfg_rd(g_se, 0x260) != SE_PACK0 || gfg_rd(g_se, 0x284) != SE_PACK0 ||
++	    (gfg_rd(g_se, SE_TX_COUNT) & 0xfffffffu) || (gfg_rd(g_se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SWEET GFG: SE8 packing/FIFO state unexpected\n");
++		return false;
++	}
++	return true;
++}
++
++int
++sweet_gfg_init(void)
++{
++	int enabled = 1;
++	(void)PE_parse_boot_argn("sweetgfg", &enabled, sizeof(enabled));
++	if (!enabled || !gfg_is_guacamole()) {
++		return -2;
++	}
++	if (g_dead) {
++		return -1;
++	}
++	if (!g_gcc) {
++		g_gcc = ml_io_map(GFG_GCC_PA, 0x60000);
++		g_tlmm = ml_io_map(GFG_NORTH_PA, (GFG_SCL + 1u) * 0x1000u);
++		g_se = ml_io_map(GFG_SE_PA, 0x4000);
++	}
++	if (!g_gcc || !g_tlmm || !g_se) {
++		printf("SWEET GFG: MMIO mapping failed\n");
++		return -1;
++	}
++	/* QUP wrapper core clocks are behind RPMh BCM QUP0 (see sweet_touch 0100). */
++	int bcm = sweet_rpmh_bcm_vote("QUP0", 1, 1);
++	if (!gfg_clocks()) {
++		return -1;
++	}
++	gfg_pin(GFG_SDA);
++	gfg_pin(GFG_SCL);
++	if (!gfg_se_init()) {
++		return -1;
++	}
++	g_ready = true;
++	struct sweet_gfg_sample s;
++	int err = sweet_gfg_read(&s);
++	printf("SWEET GFG: bq27541 @0x55 qup0-vote=%d first read err=%d soc=%u%% %umV %dmA %d.%dC rm=%u fcc=%u cc=%u flags=%#x\n",
++	    bcm, err, s.soc, s.mv, s.ma, s.centi_c / 100, (s.centi_c < 0 ? -s.centi_c : s.centi_c) % 100 / 10,
++	    s.rm_mah, s.fcc_mah, s.cycles, s.flags);
++	if (err) {
++		g_ready = false;
++		return -1;
++	}
++	return 0;
++}
++
++int
++sweet_gfg_read(struct sweet_gfg_sample *s)
++{
++	uint16_t soc = 0, volt = 0, temp = 0, flags = 0, rm = 0, fcc = 0, ai = 0, cc = 0;
++	memset(s, 0, sizeof(*s));
++	if (!g_ready || g_dead) {
++		return EIO;
++	}
++	int err = gfg_word(BQ_SOC, &soc);
++	if (!err) {
++		err = gfg_word(BQ_VOLT, &volt);
++	}
++	if (!err) {
++		err = gfg_word(BQ_AI, &ai);
++	}
++	if (!err) {
++		err = gfg_word(BQ_TEMP, &temp);
++	}
++	if (!err) {
++		err = gfg_word(BQ_FLAGS, &flags);
++	}
++	if (!err) {
++		err = gfg_word(BQ_RM, &rm);
++	}
++	if (!err) {
++		err = gfg_word(BQ_FCC, &fcc);
++	}
++	if (!err) {
++		err = gfg_word(BQ_CC, &cc);
++	}
++	if (err) {
++		return err;
++	}
++	/* Reject implausible samples instead of reporting 0% or a bogus voltage. */
++	if (soc > 100 || volt < 2800 || volt > 4600 || temp < 2331 || temp > 3531) {
++		return ERANGE;
++	}
++	s->soc = soc;
++	s->mv = volt;
++	s->ma = (int16_t)ai;
++	s->centi_c = ((int)temp - 2731) * 10;
++	s->flags = flags;
++	s->rm_mah = rm;
++	s->fcc_mah = fcc;
++	s->cycles = cc;
++	s->discharging = (flags & 1u) != 0;
++	s->full = (flags & (1u << 9)) != 0;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --color -ruN a/bsd/dev/sweet_gfg.h b/bsd/dev/sweet_gfg.h
+--- a/bsd/dev/sweet_gfg.h	1970-01-01 01:00:00.000000000 +0100
++++ b/bsd/dev/sweet_gfg.h	2026-11-06 13:14:00.852683329 +0100
+@@ -0,0 +1,25 @@
++/* guacamole bq27541 fuel gauge (bsd/dev/sweet_gfg.c). Thread context only. */
++#ifndef SWEET_GFG_H
++#define SWEET_GFG_H
++#include <stdint.h>
++#include <stdbool.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++struct sweet_gfg_sample {
++	unsigned soc;           /* % */
++	unsigned mv;
++	int ma;                 /* positive = charging */
++	int centi_c;            /* centidegrees C */
++	unsigned flags;
++	unsigned rm_mah, fcc_mah, cycles;
++	bool discharging, full;
++};
++/* 0 when the gauge answered; -2 not guacamole/disabled; -1 failed (may be retried). */
++int sweet_gfg_init(void);
++/* 0 on a plausible sample; errno otherwise (sample zeroed). */
++int sweet_gfg_read(struct sweet_gfg_sample *s);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --color -ruN a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-06 13:14:00.851740964 +0100
++++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-06 13:14:00.852213878 +0100
+@@ -3,6 +3,9 @@
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ * guacamole: the bq27541 fuel gauge (bsd/dev/sweet_gfg.c) supplies real SOC,
++ * voltage, current, temperature, capacities and cycle count, polled every
++ * 30 s by default (sweetgfg=0 disables it).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -15,6 +18,7 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++#include "../../../bsd/dev/sweet_gfg.h"
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -26,8 +30,13 @@
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fGauge, fGaugeGood, fGuac;
+ 	int fLastMode;
++	/* Published capacity model; sweet keeps the DT nominal 5020 mAh. */
++	unsigned fDesign, fMaxCap, fCycles;
++	int fCentiC;
++	bool fTempMeasured;
++	struct sweet_gfg_sample fLast;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -51,7 +60,12 @@
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fGauge = fGaugeGood = fGuac = false;
++	fDesign = fMaxCap = 5020;
++	fCycles = 0;
++	fCentiC = 2500;
++	fTempMeasured = false;
++	bzero(&fLast, sizeof(fLast));
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -101,11 +115,11 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units. powerd computes C*100/M. */
++	const unsigned capacity = (fMaxCap * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(fMaxCap);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -115,19 +129,19 @@
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+ 	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
+-	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	setCycleCount(fCycles);
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", fMaxCap);
++	putNumber("DesignCapacity", fDesign);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C (fixed 25 C unless measured). */
++	putNumber("Temperature", (UInt32)fCentiC);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+-	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatterySOCEstimated", measured && !fGauge);
++	putBool("SweetBatteryTemperatureEstimated", !fTempMeasured);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -137,7 +151,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, fMaxCap, mv, (UInt32)ma, fCycles,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -154,7 +168,7 @@
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    !measured ? "static fallback" : fGauge ? "bq27541 gauge" : "PM6150 / estimated SOC",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -206,6 +220,42 @@
+ void
+ SweetBattery::poll(void)
+ {
++	static unsigned polls;
++	polls++;
++	if (fGuac && !fGauge && polls <= 10) {
++		/* Retry: SE8/RPMh may not be ready when IOKit starts this service. */
++		fGauge = sweet_gfg_init() == 0;
++		if (fGauge || polls == 4 || polls == 10) {
++			IOLog("SWEET BATTERY: bq27541 gauge %s (attempt %u)\n", fGauge ? "ready" : "not available", polls);
++		}
++	}
++	if (fGauge) {
++		struct sweet_gfg_sample g;
++		if (sweet_gfg_read(&g) == 0) {
++			fLast = g;
++			fGaugeGood = true;
++		} else if (!fGaugeGood) {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++			return;
++		}
++		/* A failed read keeps the last good sample (VOOC may own the bus). */
++		const struct sweet_gfg_sample &b = fLast;
++		/* OnePlus 7 Pro nominal 4000 mAh; prefer the gauge's learned FCC. */
++		fDesign = 4000;
++		fMaxCap = (b.fcc_mah >= 1000 && b.fcc_mah <= 6000) ? b.fcc_mah : 4000;
++		fCycles = b.cycles < 10000 ? b.cycles : 0;
++		fCentiC = b.centi_c;
++		fTempMeasured = true;
++		bool charging = b.ma > 20;
++		bool external = !b.discharging || charging;
++		publish(b.soc, b.mv, b.ma, external, external, charging, b.full && external, true, true);
++		if (polls == 4 || polls % 20 == 0) {
++			IOLog("SWEET BATTERY: gauge %u%% %umV %dmA %d.%02dC fcc %u rm %u cycles %u flags %#x\n",
++			    b.soc, b.mv, b.ma, b.centi_c / 100, (b.centi_c < 0 ? -b.centi_c : b.centi_c) % 100,
++			    b.fcc_mah, b.rm_mah, b.cycles, b.flags);
++		}
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -264,7 +314,11 @@
+ 	}
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	int gfg = sweet_gfg_init();
++	fGauge = gfg == 0;
++	fGuac = gfg != -2;
++	/* guacamole keeps the timer even if the first gauge probe failed (retries). */
++	fReal = fGuac || (real == 1 && sweet_spmi_init() == 0);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
