@@ -12,6 +12,9 @@ on:
       machine_config:
         description: xnu MACHINE_CONFIG
         default: SWEET
+      runner:
+        description: runner label (macos-15 = arm64, often no capacity; macos-15-intel = x86_64)
+        default: macos-15-intel
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -36,7 +39,9 @@ jobs:
   build:
     # GitHub retired macos-14 (Xcode 15.x) on 2026-11-02; macos-15 has Xcode 16.x+.
     # Xcode 16's iig emits IORPC.kernelContent (xnu-10063+), handled by a kernel patch.
-    runs-on: macos-15
+    # arm64 macos-15 runners often sit queued for hours (capacity); the build is a pure
+    # cross-compile, so the x86_64 image works the same.
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
