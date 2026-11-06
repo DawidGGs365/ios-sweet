@@ -1,3 +1,5 @@
+> **guacamole fork:** this file is the upstream `sweet` (Redmi Note 10 Pro) engineering log. The OnePlus 7 Pro port's log, test results and stock-driver findings are in unixnu-guacamole `NOTES.md`; the current status is in `README.md`.
+
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 ## Agent handoff / active work (2026-10-15, latest)
