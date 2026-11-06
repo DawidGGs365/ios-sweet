@@ -1,0 +1,428 @@
+diff --color -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_gfg.c			standard
+ bsd/dev/sweet_dsi.c			standard
++bsd/dev/sweet_board.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --color -ruN a/bsd/dev/sweet_board.c b/bsd/dev/sweet_board.c
+--- a/bsd/dev/sweet_board.c	1970-01-01 01:00:00.000000000 +0100
++++ b/bsd/dev/sweet_board.c	2026-11-06 13:59:01.402633497 +0100
+@@ -0,0 +1,41 @@
++/*
++ * Board identity shared by the SWEET-config drivers: the guacamole ADT root
++ * lists "oneplus,guacamole" in /compatible (unixnu-guacamole
++ * make-guacamole-adt.py); sweet (Redmi Note 10 Pro) does not. The device
++ * tree is immutable after boot, so the answer is computed once.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++bool sweet_is_guacamole(void);
++
++static int sweet_board_guac = -1;       /* -1 unknown, 0 sweet, 1 guacamole */
++
++bool
++sweet_is_guacamole(void)
++{
++	int v = __atomic_load_n(&sweet_board_guac, __ATOMIC_RELAXED);
++	if (v >= 0) {
++		return v != 0;
++	}
++	DTEntry root;
++	void const *prop;
++	unsigned int size;
++	v = 0;
++	if (SecureDTLookupEntry(NULL, "/", &root) == kSuccess &&
++	    SecureDTGetProperty(root, "compatible", &prop, &size) == kSuccess) {
++		const char *c = (const char *)prop;
++		for (unsigned int i = 0; i < size && !v;) {
++			unsigned int n = (unsigned int)strnlen(c + i, size - i);
++			v = n == sizeof("oneplus,guacamole") - 1 &&
++			    strncmp(c + i, "oneplus,guacamole", n) == 0;
++			i += n + 1;
++		}
++	}
++	__atomic_store_n(&sweet_board_guac, v, __ATOMIC_RELAXED);
++	return v != 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --color -ruN a/bsd/dev/sweet_dsi.c b/bsd/dev/sweet_dsi.c
+--- a/bsd/dev/sweet_dsi.c	2026-11-06 13:58:37.685886910 +0100
++++ b/bsd/dev/sweet_dsi.c	2026-11-06 13:58:37.711068159 +0100
+@@ -24,6 +24,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ 
++extern bool sweet_is_guacamole(void);        /* bsd/dev/sweet_board.c */
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_dsi_set_brightness(unsigned level);
+ void sweet_dsi_init(void);
+@@ -62,35 +63,11 @@
+ }
+ 
+ static bool
+-dsi_is_guacamole(void)
+-{
+-	DTEntry root;
+-	void const *prop;
+-	unsigned int size;
+-	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
+-	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
+-		return false;
+-	}
+-	const char *c = (const char *)prop;
+-	for (unsigned int i = 0; i < size;) {
+-		unsigned int n = 0;
+-		while (i + n < size && c[i + n] != '\0') {
+-			n++;
+-		}
+-		if (n == sizeof("oneplus,guacamole") - 1 && strncmp(c + i, "oneplus,guacamole", n) == 0) {
+-			return true;
+-		}
+-		i += n + 1;
+-	}
+-	return false;
+-}
+-
+-static bool
+ dsi_setup(void)
+ {
+ 	int enabled = 1;
+ 	(void)PE_parse_boot_argn("sweetdsi", &enabled, sizeof(enabled));
+-	if (!enabled || !dsi_is_guacamole()) {
++	if (!enabled || !sweet_is_guacamole()) {
+ 		return false;
+ 	}
+ 	if (!d_base) {
+diff --color -ruN a/bsd/dev/sweet_gfg.c b/bsd/dev/sweet_gfg.c
+--- a/bsd/dev/sweet_gfg.c	2026-11-06 13:58:37.680727743 +0100
++++ b/bsd/dev/sweet_gfg.c	2026-11-06 13:58:37.710850196 +0100
+@@ -18,6 +18,7 @@
+ #include <pexpert/device_tree.h>
+ #include "sweet_gfg.h"
+ 
++extern bool sweet_is_guacamole(void);        /* bsd/dev/sweet_board.c */
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_rpmh_bcm_vote(const char *res, uint32_t vote_x, uint32_t vote_y);
+ 
+@@ -106,30 +107,6 @@
+ }
+ 
+ static bool
+-gfg_is_guacamole(void)
+-{
+-	DTEntry root;
+-	void const *prop;
+-	unsigned int size;
+-	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
+-	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
+-		return false;
+-	}
+-	const char *c = (const char *)prop;
+-	for (unsigned int i = 0; i < size;) {
+-		unsigned int n = 0;
+-		while (i + n < size && c[i + n] != '\0') {
+-			n++;
+-		}
+-		if (n == sizeof("oneplus,guacamole") - 1 && strncmp(c + i, "oneplus,guacamole", n) == 0) {
+-			return true;
+-		}
+-		i += n + 1;
+-	}
+-	return false;
+-}
+-
+-static bool
+ gfg_clocks(void)
+ {
+ 	gfg_wr(g_gcc, GFG_GCC_VOTE, gfg_rd(g_gcc, GFG_GCC_VOTE) | GFG_VOTE_MASK);
+@@ -343,7 +320,7 @@
+ {
+ 	int enabled = 1;
+ 	(void)PE_parse_boot_argn("sweetgfg", &enabled, sizeof(enabled));
+-	if (!enabled || !gfg_is_guacamole()) {
++	if (!enabled || !sweet_is_guacamole()) {
+ 		return -2;
+ 	}
+ 	if (g_dead) {
+diff --color -ruN a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c	2026-11-06 13:58:37.683493100 +0100
++++ b/bsd/dev/sweet_keys.c	2026-11-06 13:58:37.710981705 +0100
+@@ -26,6 +26,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ 
++extern bool sweet_is_guacamole(void);        /* bsd/dev/sweet_board.c */
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ extern bool sweet_hid_ringer(int ring);
+@@ -104,30 +105,6 @@
+ 	return false;
+ }
+ 
+-static bool
+-keys_is_guacamole(void)
+-{
+-	DTEntry root;
+-	void const *prop;
+-	unsigned int size;
+-	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
+-	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
+-		return false;
+-	}
+-	const char *c = (const char *)prop;
+-	for (unsigned int i = 0; i < size;) {
+-		unsigned int n = 0;
+-		while (i + n < size && c[i + n] != '\0') {
+-			n++;
+-		}
+-		if (n == sizeof("oneplus,guacamole") - 1 && strncmp(c + i, "oneplus,guacamole", n) == 0) {
+-			return true;
+-		}
+-		i += n + 1;
+-	}
+-	return false;
+-}
+-
+ /* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ static bool
+ keys_gpio_check(unsigned g)
+@@ -147,7 +124,6 @@
+ 	return ok;
+ }
+ 
+-
+ /* Alert slider: TLMM tile + 0x1000 * gpio; CTL at +0, IN_OUT at +4. */
+ static struct {
+ 	uint32_t pa;
+@@ -298,7 +274,7 @@
+ 		    keys_version, count);
+ 		return;
+ 	}
+-	keys_guac = keys_is_guacamole();
++	keys_guac = sweet_is_guacamole();
+ 	if (keys_guac) {
+ 		keys_gpio[0].ppid = 0x0c5;      /* PM8150 SID 0 GPIO6 */
+ 		keys_gpio[0].base = 0xc500;
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 13:58:37.691229156 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 13:58:37.711836879 +0100
+@@ -19,6 +19,8 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>
++
++extern bool sweet_is_guacamole(void);        /* bsd/dev/sweet_board.c */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -130,34 +132,10 @@
+ 	{0x18004, 0x18008, 0x1800c, 0x18010, 0x18144}, 5,
+ };
+ 
+-static bool
+-touch_is_guacamole(void)
+-{
+-	DTEntry root;
+-	void const *prop;
+-	unsigned int size;
+-	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
+-	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
+-		return false;
+-	}
+-	const char *s = (const char *)prop;
+-	for (unsigned int i = 0; i < size;) {
+-		unsigned int n = 0;
+-		while (i + n < size && s[i + n] != '\0') {
+-			n++;
+-		}
+-		if (n == sizeof("oneplus,guacamole") - 1 && strncmp(s + i, "oneplus,guacamole", n) == 0) {
+-			return true;
+-		}
+-		i += n + 1;
+-	}
+-	return false;
+-}
+-
+ static void
+ touch_select_board(void)
+ {
+-	if (!touch_is_guacamole()) {
++	if (!sweet_is_guacamole()) {
+ 		return;
+ 	}
+ 	hw.guac = true;
+diff --color -ruN a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c	2026-11-06 13:58:37.688245345 +0100
++++ b/bsd/dev/sweet_usb.c	2026-11-06 13:59:30.116839532 +0100
+@@ -39,6 +39,7 @@
+ #include <sys/kern_event.h>
+ #include <stdarg.h>
+ 
++extern bool sweet_is_guacamole(void);        /* bsd/dev/sweet_board.c */
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);     /* bsd/dev/sweet_rpmh.c */
+ void sweet_usb_probe(void);
+@@ -120,36 +121,12 @@
+  * unclocked block (bus hang). DWC3, QSCRATCH and the HS PHY share their
+  * addresses on both SoCs.
+  */
+-static bool
+-usb_soc_is_sm8150(void)
+-{
+-	DTEntry root;
+-	void const *prop;
+-	unsigned int size;
+-	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
+-	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
+-		return false;
+-	}
+-	const char *s = (const char *)prop;
+-	for (unsigned int i = 0; i < size;) {
+-		unsigned int n = 0;
+-		while (i + n < size && s[i + n] != '\0') {
+-			n++;
+-		}
+-		if (n == sizeof("oneplus,guacamole") - 1 && strncmp(s + i, "oneplus,guacamole", n) == 0) {
+-			return true;
+-		}
+-		i += n + 1;
+-	}
+-	return false;
+-}
+-
+ static bool usb_guac;
+ 
+ static void
+ usb_soc_select(void)
+ {
+-	if (!usb_soc_is_sm8150()) {
++	if (!sweet_is_guacamole()) {
+ 		return;
+ 	}
+ 	usb_guac = true;
+diff --color -ruN a/iokit/Kernel/arm/SweetBacklight.cpp b/iokit/Kernel/arm/SweetBacklight.cpp
+--- a/iokit/Kernel/arm/SweetBacklight.cpp	2026-11-06 13:58:37.693971133 +0100
++++ b/iokit/Kernel/arm/SweetBacklight.cpp	2026-11-06 13:58:37.711936838 +0100
+@@ -20,6 +20,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ 
++extern "C" bool sweet_is_guacamole(void);   /* bsd/dev/sweet_board.c */
+ extern "C" int sweet_dsi_set_brightness(unsigned level);
+ 
+ class SweetBacklight : public IOService {
+@@ -35,30 +36,6 @@
+ };
+ OSDefineMetaClassAndStructors(SweetBacklight, IOService);
+ 
+-static bool
+-sweet_bl_is_guacamole(void)
+-{
+-	DTEntry root;
+-	void const *prop;
+-	unsigned int size;
+-	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
+-	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
+-		return false;
+-	}
+-	const char *c = (const char *)prop;
+-	for (unsigned int i = 0; i < size;) {
+-		unsigned int n = 0;
+-		while (i + n < size && c[i + n] != '\0') {
+-			n++;
+-		}
+-		if (n == sizeof("oneplus,guacamole") - 1 && strncmp(c + i, "oneplus,guacamole", n) == 0) {
+-			return true;
+-		}
+-		i += n + 1;
+-	}
+-	return false;
+-}
+-
+ void
+ SweetBacklight::publishLevel(unsigned level)
+ {
+@@ -101,7 +78,7 @@
+ bool
+ SweetBacklight::start(IOService *provider)
+ {
+-	if (!sweet_bl_is_guacamole() || !IOService::start(provider)) {
++	if (!sweet_is_guacamole() || !IOService::start(provider)) {
+ 		return false;
+ 	}
+ 	fLogged = 0;
+diff --color -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-06 13:58:37.696497593 +0100
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-06 13:58:47.780207008 +0100
+@@ -112,6 +112,7 @@
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	bool          fStretch;                 /* scale the presented screen to the panel */
++	uint32_t     *fRowBuf;                  /* cached scratch row for the stretch */
+ 	uint16_t     *fColMap;                  /* panel column -> presented column */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -198,7 +199,8 @@
+ 	fStretch = !native && stretch && fWidth > fLogicalW && fHeight > fLogicalH;
+ 	if (fStretch) {
+ 		fColMap = IONew(uint16_t, fWidth);
+-		if (fColMap == NULL) {
++		fRowBuf = IONew(uint32_t, fWidth);
++		if (fColMap == NULL || fRowBuf == NULL) {
+ 			fStretch = false;
+ 		} else {
+ 			for (uint32_t px = 0; px < fWidth; px++) {
+@@ -447,8 +449,11 @@
+ 
+ /*
+  * Nearest-neighbour scale of one layer from presented (logical) to panel
+- * coordinates. Panel row/column p shows logical p * L / P; repeated rows
+- * are copied from the panel row above.
++ * coordinates. Panel row/column p shows logical p * L / P. Each logical
++ * row is scaled once into the cached fRowBuf and then written to every
++ * panel row that shows it: the panel memory is write-combined, so it is
++ * never read back (the old copy-from-the-row-above read ~22 % of the
++ * 1440x3120 panel uncached on every frame).
+  */
+ void
+ AppleCLCD::presentStretched(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
+@@ -484,20 +489,20 @@
+ 		return;
+ 	}
+ 	const size_t bytes = (size_t)(px1 - px0) * 4;
++	const uint16_t *map = fColMap + px0;
++	const int64_t n = px1 - px0;
+ 	int64_t prev = -1;
+ 	for (int64_t py = py0; py < py1; py++) {
+ 		int64_t ly = py * lh / ph;
+-		uint32_t *dst = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
+-		if (ly == prev) {
+-			memcpy(dst, (const void *)((uintptr_t)dst - fRowBytes), bytes);
+-			continue;
+-		}
+-		prev = ly;
+-		const uint32_t *row = (const uint32_t *)(src + s->offset +
+-		    (uint64_t)(sy + (ly - dy)) * s->bytesPerRow + (uint64_t)sx * 4);
+-		for (int64_t px = px0; px < px1; px++) {
+-			*dst++ = row[fColMap[px] - dx];
++		if (ly != prev) {
++			prev = ly;
++			const uint32_t *row = (const uint32_t *)(src + s->offset +
++			    (uint64_t)(sy + (ly - dy)) * s->bytesPerRow + (uint64_t)sx * 4);
++			for (int64_t i = 0; i < n; i++) {
++				fRowBuf[i] = row[map[i] - dx];
++			}
+ 		}
++		memcpy((void *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4), fRowBuf, bytes);
+ 	}
+ }
+ 
