@@ -1,5 +1,14 @@
+guacamole display: early framebuffer geometry, iPhone X scaled to 1440x3120, empty IOAcceleratorES, 60 Hz timing
+
+Squashed from (in order):
+  0082-guacamole-early-fb-geometry
+  0083-guacamole-scale-up-iphone-x-display
+  0088-guacamole-empty-ioacceleratores
+  0131-guacamole-zero-copy-surfaces
+  0132-guacamole-wrap-offset-black-off-fb-timing
+
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a62416c..4251721 100644
+index a62416c..2b40e40 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -77,6 +77,13 @@ enum {
@@ -25,16 +34,32 @@ index a62416c..4251721 100644
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
-@@ -122,6 +131,8 @@ public:
+@@ -122,8 +131,24 @@ public:
  	void removeClient(IOMobileFramebufferUserClient *client);
  	void swap(const uint8_t *rec);
  	void present(const uint8_t *rec);
 +	void presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
 +	    int32_t w, int32_t h);
++};
++
++/*
++ * From ios-topaz 0138 (topaz-0138, MakrSas/ios-topaz): the graphics
++ * accelerator's service class. QuartzCore (CAMetalContextCreate, once per
++ * process) polls IOServiceMatching("IOAcceleratorES") 300 times, 100 ms
++ * apart: thirty seconds at every backboardd start. One without
++ * MetalPluginName/MetalPluginClassName is found and then passed over by
++ * Metal (MTLRegisterDevices), which leaves the renderers as they were.
++ * Boot-arg sweetaccel=0 turns it off.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
  };
  
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -174,8 +185,22 @@ AppleCLCD::start(IOService *provider)
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -174,8 +199,22 @@ AppleCLCD::start(IOService *provider)
  		fLogicalW = SWEET_FB_LOGICAL_W;
  		fLogicalH = SWEET_FB_LOGICAL_H;
  	}
@@ -59,7 +84,7 @@ index a62416c..4251721 100644
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -201,8 +226,9 @@ AppleCLCD::start(IOService *provider)
+@@ -201,8 +240,20 @@ AppleCLCD::start(IOService *provider)
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
@@ -68,10 +93,67 @@ index a62416c..4251721 100644
 +	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
 +	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
 +	    fScaleUp ? " (scaled up)" : "");
++	uint32_t accelOn = 1;
++	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
++	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
++	if (accel != NULL && accel->init()) {
++		accel->setName("sgx");
++		if (accel->attach(this)) {
++			accel->registerService();
++			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
++		}
++	}
++	OSSafeReleaseNULL(accel);
  	return true;
  }
  
-@@ -308,6 +334,72 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -225,18 +276,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
++		/*
++		 * Black, once. 0132: the fade (halving every pixel on 7 vsyncs) read back the
++		 * write-combined panel memory, slowly enough to be seen frame by frame.
++		 */
+ 		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
+-			fb->fFadeStep = step + 1;
+-		}
++		fb->fFadeStep = 1;
+ 		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
++		if (step == 0) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+-				}
++				bzero((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes), (size_t)fb->fWidth * 4);
+ 			}
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -253,8 +302,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		/* 0132: what showing a frame costs (sweetfb_hz: can the CPU keep up at 60?) */
++		static uint64_t shown, spent;
++		uint64_t began = mach_absolute_time();
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		spent += mach_absolute_time() - began;
++		if (++shown % 300 == 0) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(spent, &ns);
++			IOLog("SWEET FB: %llu frames shown, %llu us each (last 300), every %u vsync(s)\n", shown,
++			    ns / 1000 / 300, fb->fFlushTicks);
++			spent = 0;
++		}
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+@@ -308,6 +368,72 @@ AppleCLCD::swap(const uint8_t *rec)
  	}
  }
  
@@ -144,10 +226,17 @@ index a62416c..4251721 100644
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -359,6 +451,11 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -359,6 +485,18 @@ AppleCLCD::present(const uint8_t *rec)
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
++		if (s->drawn != 0 && s->memory != NULL) {
++			/*
++			 * 0131: the GPU draws into surfaces (RedwoodGPU) past this processor's cache;
++			 * what the cache still holds of this one is older than the memory.
++			 */
++			s->memory->performOperation(kIOMemoryIncoherentIOFlush, 0, s->memory->getLength());
++		}
 +		if (fScaleUp) {
 +			presentScaled(s, sx, sy, dx, dy, w, h);
 +			s->release();
@@ -156,3 +245,41 @@ index a62416c..4251721 100644
  		/* Logical (presented) display coordinates -> panel coordinates. */
  		dx -= fOffX;
  		dy -= fOffY;
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..9d36822 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,10 +515,11 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	/* GUACAMOLE (OnePlus 7 Pro): 1440x3120 panel, stride 5760 */
++	MOV64	x0, (0x9c000000 + 3088 * 5760)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	mov		x4, #5760
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..764e2b2 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -13,10 +13,11 @@
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
+-#define EARLY_SCALE 2u
++/* GUACAMOLE (OnePlus 7 Pro): ABL splash is 1440x3120 a8r8g8b8, stride 5760 */
++#define EARLY_WIDTH 1440u
++#define EARLY_HEIGHT 3120u
++#define EARLY_STRIDE (5760u / 4)
++#define EARLY_SCALE 3u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+ #define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)

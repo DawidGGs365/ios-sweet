@@ -1,0 +1,606 @@
+guacamole power: RPMh rails (touch L17A, USB PHY), SPMI, PM8150 RTC, PM8150B battery
+
+Squashed from (in order):
+  0085-guacamole-s6sy761-touch
+  0095-guacamole-gpu-stage5-hfi
+  0133-guacamole-pm8150-rtc
+  0136-guacamole-pm8150b-battery
+  0138-guacamole-pmem-rpmh
+  0144-guacamole-usb-live-log-from-unixnu
+
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..b6b663e 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -12,6 +12,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_cmd_db_aux(const char *res, uint16_t *out, unsigned max, unsigned *count);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -44,6 +45,7 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_ARC          3u
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -186,9 +188,9 @@ rh_lookup(const char *res, uint32_t *address)
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if ((slave != RH_VRM && slave != RH_ARC) || (addr >> 16) != slave || (addr & 15u) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid VRM/ARC entry for %s\n", res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -205,6 +207,55 @@ rh_lookup(const char *res, uint32_t *address)
+ 	return 0;
+ }
+ 
++/*
++ * GUACAMOLE: cmd-db auxiliary data of one resource (any slave type), as
++ * the little-endian 16-bit words Linux's cmd_db_read_aux_data() returns:
++ * the ARC levels ("gfx.lvl", "cx.lvl", "mx.lvl") the GMU perf table needs.
++ * Read-only; no RSC traffic.
++ */
++int
++sweet_cmd_db_aux(const char *res, uint16_t *out, unsigned max, unsigned *count)
++{
++	int err = rh_map();
++	if (err) {
++		return err;
++	}
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned n = rh_db16(h + 6);
++		if ((entries & 3u) || !rh_range(entries, n * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < n; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t len = rh_db16(e + 20), off = aux + rh_db16(e + 22);
++			if ((len & 1u) || !rh_range(off, len)) {
++				return EINVAL;
++			}
++			unsigned words = len / 2u;
++			for (unsigned k = 0; k < words && k < max; ++k) {
++				out[k] = rh_db16(off + 2u * k);
++			}
++			*count = words < max ? words : max;
++			return 0;
++		}
++	}
++	return ENOENT;
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -219,7 +270,7 @@ rh_free(unsigned t)
+ }
+ 
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32_t *values)
+ {
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+@@ -234,7 +285,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited request for %#x in TCS%u\n", address, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -266,11 +317,10 @@ rh_send(uint32_t address, unsigned mv)
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	uint32_t mask = (1u << n) - 1u;
++	printf("SWEET RPMH: TCS%u ACTIVE %u commands at %#x (first %#x=%u) irq-enable=%#x\n", t, n, address,
++	    offsets[0], values[0], irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+ 		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+@@ -278,18 +328,18 @@ rh_send(uint32_t address, unsigned mv)
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
++	uint32_t irq = 0, idle = 0, status[4] = {0, 0, 0, 0};
+ 	bool done = false, progress = false;
+ 	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -320,16 +370,77 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
+ 	return 0;
+ }
+ 
++static int
++rh_send(uint32_t address, unsigned mv)
++{
++	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++	const uint32_t offsets[3] = {0, 8, 4};
++	const uint32_t values[3] = {mv, 7, 1};
++	return rh_send_cmds(address, 3, offsets, values);
++}
++
++/*
++ * Any VRM or ARC resource, 1-4 commands (offset from the resource address,
++ * value): for /dev/pmem's PMEM_RPMH (userland bring-up of the modem and
++ * WLAN: ARC levels of cx/mss, WLAN rails). No policy: a debugging path.
++ */
++int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++
++int
++sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values)
++{
++	if (!res || n == 0 || n > 4) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (!rh_poisoned) {
++		error = rh_map();
++		if (!error) {
++			error = rh_lookup(res, &address);
++		}
++		if (!error) {
++			error = rh_send_cmds(address, n, offsets, values);
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/*
++	 * Board-specific helper: do not apply PMIC5-LDO policy to arbitrary
++	 * resources. Only these PMIC5 LDOs, at their DT voltages:
++	 * ldoa17 PM8150 L17A (touch AVDD, DT 2856..3008 mV);
++	 * USB HS PHY (hsphy@88e2000, sweet_usb.c live log): ldoa5 vdd 0.88 V,
++	 * ldoa12 vdda18 1.8 V, ldoa2 vdda33 3.072 V.
++	 */
++	static const struct {
++		const char *res;
++		unsigned min, max;
++	} allowed[] = {
++		{ "ldoa17", 2856, 3008 },
++		{ "ldoa5", 880, 880 },
++		{ "ldoa12", 1704, 1800 },
++		{ "ldoa2", 3050, 3300 },
++	};
++	bool ok = false;
++	for (unsigned i = 0; res != NULL && i < sizeof(allowed) / sizeof(allowed[0]); i++) {
++		if (strcmp(res, allowed[i].res) == 0 && mv >= allowed[i].min && mv <= allowed[i].max) {
++			ok = true;
++		}
++	}
++	if (!ok) {
++		printf("SWEET RPMH: %s %u mV is not an allowed rail/voltage\n", res ? res : "(null)", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --git a/bsd/dev/sweet_rtc.c b/bsd/dev/sweet_rtc.c
+new file mode 100644
+index 0000000..e5257ef
+--- /dev/null
++++ b/bsd/dev/sweet_rtc.c
+@@ -0,0 +1,136 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Wall clock from the PM8150 RTC (guacamole).
++ *
++ * The PMIC's RTC (SPMI SID 0, peripheral 0x60; live DT qcom,pm8150_rtc_rw@6000)
++ * keeps counting seconds while the phone is off, but not from 1970: Android
++ * set its clock to "1970-04-22 01:34:15 UTC (9596055)" from it and kept the
++ * offset to real time in userdata (QTI time_daemon), which iOS has replaced.
++ * So the time is RTC + an offset of ours, kept in OFFSET_FILE on the iOS root.
++ *
++ * Boot-arg sweettime=<unix seconds> (tools/guac-mkboot.sh puts the Mac's time
++ * there when it builds an image) gives the offset afresh when it is later
++ * than what the stored offset says; then it is stored. Without either, the
++ * clock stays as it was (1970).
++ *
++ * Registers (Linux drivers/rtc/qpnp-rtc.c): RTC_CTRL +0x46 (bit 7 enabled),
++ * RTC_READ +0x48..0x4b, little endian; the low byte is read again and the four
++ * read anew if it moved on in between.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++#define RTC_BASE        0x6000u
++#define RTC_CTRL        (RTC_BASE + 0x46u)
++#define RTC_READ        (RTC_BASE + 0x48u)
++#define OFFSET_FILE     "/private/var/db/sweet-rtc-offset"
++#define SANE_TIME       1600000000ll    /* 2020: anything earlier is not the time */
++
++void sweet_rtc_init(void);
++
++static int
++rtc_read(uint32_t *secs)
++{
++	uint8_t b[4], again;
++	for (int tries = 0; tries < 3; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(0, RTC_READ + i, &b[i]) != 0) {
++				return -1;
++			}
++		}
++		if (sweet_spmi_read(0, RTC_READ, &again) != 0) {
++			return -1;
++		}
++		if (again == b[0]) {
++			*secs = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++offset_load(int64_t *offset)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	struct vnode *vp = NULLVP;
++	char text[32];
++	if (vnode_open(OFFSET_FILE, FREAD, 0, 0, &vp, ctx) != 0) {
++		return -1;
++	}
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	uio_addiov(uio, (user_addr_t)(uintptr_t)text, sizeof(text) - 1);
++	int err = VNOP_READ(vp, uio, 0, ctx);
++	size_t got = sizeof(text) - 1 - (size_t)uio_resid(uio);
++	uio_free(uio);
++	vnode_close(vp, FREAD, ctx);
++	if (err != 0 || got == 0) {
++		return -1;
++	}
++	text[got] = 0;
++	*offset = (int64_t)strtoq(text, NULL, 10);
++	return 0;
++}
++
++static void
++offset_store(int64_t offset)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	struct vnode *vp = NULLVP;
++	char text[32];
++	int n = snprintf(text, sizeof(text), "%lld\n", (long long)offset);
++	int err = vnode_open(OFFSET_FILE, FWRITE | O_CREAT, 0644, 0, &vp, ctx);
++	if (err == 0) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_data_size, 0);       /* vnode_open does not truncate (0119) */
++		err = vnode_setattr(vp, &va, ctx);
++		if (err == 0) {
++			uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
++			uio_addiov(uio, (user_addr_t)(uintptr_t)text, (user_size_t)n);
++			err = VNOP_WRITE(vp, uio, 0, ctx);
++			uio_free(uio);
++		}
++		vnode_close(vp, FWRITE, ctx);
++	}
++	printf("SWEET RTC: offset %lld stored in " OFFSET_FILE ": %d\n", (long long)offset, err);
++}
++
++/* bsd_init, after the root is mounted (the offset file lives there). */
++void
++sweet_rtc_init(void)
++{
++	uint8_t ctrl = 0;
++	uint32_t rtc;
++	if (sweet_spmi_init() != 0 || sweet_spmi_read(0, RTC_CTRL, &ctrl) != 0 || rtc_read(&rtc) != 0) {
++		printf("SWEET RTC: PM8150 RTC not readable\n");
++		return;
++	}
++	int64_t offset = 0;
++	bool stored = offset_load(&offset) == 0;
++	long long given = 0;
++	char arg[24] = "";
++	if (PE_parse_boot_arg_str("sweettime", arg, sizeof(arg))) {
++		given = strtoq(arg, NULL, 10);
++	}
++	const char *from = stored ? "file" : "none";
++	if (given >= SANE_TIME && (!stored || given > (long long)rtc + offset)) {
++		offset = (int64_t)given - (int64_t)rtc;
++		offset_store(offset);
++		from = "boot-arg sweettime";
++	}
++	int64_t now = (int64_t)rtc + offset;
++	printf("SWEET RTC: PM8150 RTC %u s (ctrl %#x), offset %lld (%s), time %lld\n", rtc, ctrl,
++	    (long long)offset, from, (long long)now);
++	if (now >= SANE_TIME) {
++		clock_set_calendar_microtime((clock_sec_t)now, 0);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..f8a86c6 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -88,9 +88,11 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	bool charger = peripheral >= 0x10 && peripheral <= 0x13;       /* SMB5 CHGR, DCDC, BATIF, USBIN */
++	bool allowed = sid == 0 ? charger || peripheral == 0x48 ||     /* PM6150 QG */
++	    peripheral == 0x60 :                                        /* 0133: PM8150 RTC (sweet_rtc.c) */
++	    sid == 2 && (charger || peripheral == 0x40 || peripheral == 0x41); /* 0136: PM8150B FG gen4 */
++	if (!sp_ready || !out || !allowed || addr > 0xffffu) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..5f17865 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -3,6 +3,17 @@
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ *
++ * sweetbattery=2 (guacamole, OnePlus 7 Pro): read-only PM8150B (SPMI SID 2)
++ * polling every 30 seconds. The state of charge is the fuel gauge's own
++ * (FG gen4, which runs on the battery profile Android loaded into it), so it
++ * is the phone's real percentage, not an estimate. Registers and scales from
++ * Linux drivers/power/supply/qcom (fg-reg.h, fg-util.c, smb5-reg.h of the
++ * OnePlus SM8150 kernel): monotonic SOC 0x4009 (copy 0x400a), raw 0..255;
++ * VBATT 0x41a0 (copy 0x41a6), 122.070 uV; IBATT 0x41a2 (copy 0x41a8),
++ * signed, 488.281 uA, positive = discharging. The SMB5 charger registers are
++ * those of PM6150 above, on SID 2. Temperature: BATT_INFO_BATT_TEMP 0x4150
++ * (11 bits, quarter kelvin, fg-gen3's formula); used only when plausible.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -27,12 +38,16 @@ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+-	int fLastMode;
++	int fLastMode, fKind;           /* sweetbattery: 1 PM6150, 2 PM8150B */
++	unsigned fDesign, fPolls;       /* design capacity (mAh); polls so far */
++	unsigned fTemperature;          /* centidegrees C */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	void pollFuelGauge(void);
++	static bool readShadow(unsigned address, unsigned copy, uint16_t *value);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -72,6 +87,10 @@ SweetBattery::init(OSDictionary *dictionary)
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fKind = 0;
++	fDesign = 5020;
++	fPolls = 0;
++	fTemperature = 2500;
+ 	return true;
+ }
+ 
+@@ -101,11 +120,11 @@ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (fDesign). powerd computes C*100/M. */
++	const unsigned capacity = (fDesign * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(fDesign);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,15 +138,15 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", fDesign);
++	putNumber("DesignCapacity", fDesign);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C; 25 C unless measured (fKind 2). */
++	putNumber("Temperature", fTemperature);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryTemperatureEstimated", fTemperature == 2500);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -137,7 +156,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, fDesign, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -151,11 +170,12 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		legacy->release();
+ 	}
+ 	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
+-	int mode = measured ? 1 : 0;
+-	if (mode != fLastMode) {
+-		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
+-		    percent, mv, external, charging);
++	int mode = measured ? fKind : 0;
++	/* Every change of source, and every 10th poll (5 min) for the fuel gauge. */
++	if (mode != fLastMode || (mode == 2 && fPolls % 10 == 0)) {
++		IOLog("SWEET BATTERY: %s, %u%% %umV %dmA %u.%02uC external=%d charging=%d full=%d\n",
++		    mode == 2 ? "PM8150B fuel gauge" : measured ? "PM6150 / estimated SOC" : "static fallback",
++		    percent, mv, ma, fTemperature / 100, fTemperature % 100, external, charging, full);
+ 		fLastMode = mode;
+ 	}
+ }
+@@ -203,9 +223,81 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/* A 16-bit little-endian FG value and its shadow copy, read until they agree. */
++bool
++SweetBattery::readShadow(unsigned address, unsigned copy, uint16_t *value)
++{
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t lo, hi, lo2, hi2;
++		if (sweet_spmi_read(2, address, &lo) || sweet_spmi_read(2, address + 1, &hi) ||
++		    sweet_spmi_read(2, copy, &lo2) || sweet_spmi_read(2, copy + 1, &hi2)) {
++			return false;
++		}
++		if (lo == lo2 && hi == hi2) {
++			*value = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
++			return true;
++		}
++	}
++	return false;
++}
++
++void
++SweetBattery::pollFuelGauge(void)
++{
++	uint8_t soc = 0, socCopy = 1, usb, path, charger, error, limits, tlo, thi;
++	uint16_t rawVoltage, rawCurrent;
++	for (unsigned attempt = 0; attempt < 4 && soc != socCopy; ++attempt) {
++		if (sweet_spmi_read(2, 0x4009, &soc) || sweet_spmi_read(2, 0x400a, &socCopy)) {
++			break;
++		}
++	}
++	bool valid = soc == socCopy && readShadow(0x41a0, 0x41a6, &rawVoltage) &&
++	    !sweet_spmi_read(2, 0x1310, &usb) &&
++	    !sweet_spmi_read(2, 0x110b, &path) &&
++	    !sweet_spmi_read(2, 0x1006, &charger) &&
++	    !sweet_spmi_read(2, 0x1007, &error) &&
++	    !sweet_spmi_read(2, 0x100d, &limits);
++	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
++	valid = valid && mv >= 2800 && mv <= 4600;
++	fPolls++;
++	if (!valid) {
++		fTemperature = 2500;
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	/* fg_get_msoc(): 255 is full, 0 empty, 1..254 scaled to 1..99. */
++	unsigned percent = soc == 255 ? 100 : soc == 0 ? 0 : ((soc - 1u) * 98u + 126u) / 253u + 1u;
++	int ma = 0;
++	bool currentValid = readShadow(0x41a2, 0x41a8, &rawCurrent);
++	if (currentValid) {
++		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
++		/* FG: positive = discharging; IOPMPowerSource: positive = charging. */
++		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
++	}
++	fTemperature = 2500;
++	if (!sweet_spmi_read(2, 0x4150, &tlo) && !sweet_spmi_read(2, 0x4151, &thi)) {
++		int kelvin4 = (int)(((unsigned)(thi & 7u) << 8) | tlo);
++		int centi = kelvin4 * 25 - 27315;
++		if (centi >= 0 && centi <= 7000) {     /* below 0 C: left at 25 C */
++			fTemperature = (unsigned)centi;
++		}
++	}
++	bool external = (usb & 0x10u) != 0;
++	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
++	unsigned state = charger & 7u;
++	bool charging = capable && state >= 1 && state <= 4 &&
++	    !(error & 2u) && !(limits & 0x0cu);
++	bool full = external && (state == 5 || percent == 100) && !(error & 2u);
++	publish(percent, mv, ma, external, capable, charging, full, true, currentValid);
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fReal && fKind == 2) {
++		pollFuelGauge();
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -264,7 +356,11 @@ SweetBattery::start(IOService *provider)
+ 	}
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	fReal = (real == 1 || real == 2) && sweet_spmi_init() == 0;
++	fKind = fReal ? real : 0;
++	if (fKind == 2) {
++		fDesign = 4000;         /* OnePlus 7 Pro: 4000 mAh (no capacity in its DT) */
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {

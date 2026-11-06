@@ -1,0 +1,289 @@
+guacamole security: AMFI dyld policy, cs off, sandbox extensions, trust query
+
+Squashed from (in order):
+  0121-guacamole-amfi-dyld-policy
+  0134-guacamole-amfi-cs-off
+  0135-guacamole-sandbox-extensions
+  0137-guacamole-amfi-trust-query
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..969519f 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -279,14 +279,54 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+- * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * (checks allow, profile init is accepted); container paths fail with
++ * ENOENT. The first use of each operation number is logged.
++ *
++ * Sandbox extensions are tokens a daemon issues so that a sandboxed client
++ * may reach something. tccd issues one with every grant ("Failed to issue
++ * Sandbox Extension for kTCCServicePhotos" when issuing fails), and assetsd
++ * aborts without it ("assetsd requires TCCPhotosService access": Photos
++ * never opens). libsystem_sandbox (iOS 16.7.16) passes op 5 (issue) seven
++ * u64: extension class, -, name, flags, a 2048-byte buffer for the token,
++ * pid, -; and op 6 (consume) { token, length, u64 *handle }, the handle being
++ * what sandbox_extension_consume() returns. With no sandbox to extend, any
++ * token will do: issue writes "sweet;<class>", consume accepts every token
++ * and hands out handle 1.
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_extension_issue(user_addr_t arg)
++{
++	uint64_t args[7];
++	int error = copyin(arg, args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	char class[128] = "";
++	size_t done;
++	if (args[0] != 0 && copyinstr((user_addr_t)args[0], class, sizeof(class), &done) != 0) {
++		class[0] = '\0';
++	}
++	char token[sizeof(class) + 8];
++	int len = snprintf(token, sizeof(token), "sweet;%s", class);
++	return copyout(token, (user_addr_t)args[4], (size_t)len + 1);
++}
++
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
++{
++	uint64_t args[3];               /* token, length, user address of the handle */
++	int error = copyin(arg, args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	uint64_t handle = 1;
++	return copyout(&handle, (user_addr_t)args[2], sizeof(handle));
++}
++
++static int
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -296,17 +336,87 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
++	case 5:
++		return sweet_sandbox_extension_issue(arg);
++	case 6:
++		return sweet_sandbox_extension_consume(arg);
+ 	default:
+ 		return 0;
+ 	}
+ }
+ 
++/*
++ * dyld asks AMFI what it may do for the process it is starting:
++ * amfi_check_dyld_policy_self() in iOS 16.7.16's /usr/lib/dyld is
++ * __sandbox_ms("AMFI", 90, { u64 in_flags, u64 *out_flags }). With no
++ * policy of that name the call fails and dyld runs restricted: no @ path
++ * expansion ("security policy does not allow @ path expansion", G3 run),
++ * DYLD_* variables ignored. Answer with the AMFI_DYLD_OUTPUT_* flags of
++ * dyld's ProcessConfig::Security (open-source dyld): everything except a
++ * custom shared cache.
++ *
++ * installd (InstalledContentLibrary, -[MIDaemonConfiguration
++ * codeSigningEnforcementIsDisabled]) and FrontBoardServices ask for the
++ * boot-arg state: amfi_interface_query_bootarg_state() in libmis is
++ * __sandbox_ms("AMFI", 96, u64 *flags), and installd takes code signing
++ * enforcement as disabled when (flags & 0x86) != 0. Otherwise it checks each
++ * app's signature with libmis, whose trust cache query (op 95) we cannot
++ * answer, and system apps (/private/var/staged_system_apps) never install.
++ * Boot-arg sweetcsoff=1 answers op 96 with SWEET_AMFI_BOOTARG_CS_OFF.
++ *
++ * Other AMFI operations stay unsupported (ENOSYS); the first use of each is
++ * logged.
++ */
++#define SWEET_AMFI_CHECK_DYLD_POLICY    90
++#define SWEET_AMFI_QUERY_BOOTARG_STATE  96
++#define SWEET_AMFI_DYLD_ALLOW_AT_PATH           (1ULL << 0)
++#define SWEET_AMFI_DYLD_ALLOW_PATH_VARS         (1ULL << 1)
++#define SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS    (1ULL << 3)
++#define SWEET_AMFI_DYLD_ALLOW_PRINT_VARS        (1ULL << 4)
++#define SWEET_AMFI_DYLD_ALLOW_FAILED_INSERTION  (1ULL << 5)
++#define SWEET_AMFI_DYLD_ALLOW_INTERPOSING       (1ULL << 6)
++#define SWEET_AMFI_DYLD_ALLOW_EMBEDDED_VARS     (1ULL << 7)
++#define SWEET_AMFI_BOOTARG_CS_OFF               (1ULL << 1)     /* one of installd's 0x86 */
++
++static TUNABLE(uint32_t, sweet_cs_off, "sweetcsoff", 0);
++
++static uint64_t sweet_amfi_syscall_seen[2];     /* AMFI's ops go past 64 (90, 95, 96) */
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	if (call == SWEET_AMFI_CHECK_DYLD_POLICY) {
++		uint64_t args[2];               /* in_flags, user address of out_flags */
++		int error = copyin(arg, args, sizeof(args));
++		if (error) {
++			return error;
++		}
++		uint64_t allow = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_PATH_VARS |
++		    SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS | SWEET_AMFI_DYLD_ALLOW_PRINT_VARS |
++		    SWEET_AMFI_DYLD_ALLOW_FAILED_INSERTION | SWEET_AMFI_DYLD_ALLOW_INTERPOSING |
++		    SWEET_AMFI_DYLD_ALLOW_EMBEDDED_VARS;
++		return copyout(&allow, (user_addr_t)args[1], sizeof(allow));
++	}
++	bool answered = call == SWEET_AMFI_QUERY_BOOTARG_STATE && sweet_cs_off;
++	if (call >= 0 && call < 128 && !(sweet_amfi_syscall_seen[call / 64] & (1ULL << (call % 64)))) {
++		sweet_amfi_syscall_seen[call / 64] |= 1ULL << (call % 64);
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET AMFI: %s op %d %s\n", name, call,
++		    answered ? "answered: code signing enforcement off (sweetcsoff=1)" : "unsupported");
++	}
++	if (!answered) {
++		return ENOSYS;
++	}
++	uint64_t flags = SWEET_AMFI_BOOTARG_CS_OFF;
++	return copyout(&flags, arg, sizeof(flags));
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +470,7 @@ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",             /* the name __mac_syscall callers (dyld) use */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
+diff --git a/iokit/Kernel/arm/SweetAMFI.cpp b/iokit/Kernel/arm/SweetAMFI.cpp
+new file mode 100644
+index 0000000..9be2ec8
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAMFI.cpp
+@@ -0,0 +1,97 @@
++/*
++ * A stand-in for AppleMobileFileIntegrity's IOService, which this kernel
++ * does not have (no AMFI kext). Userland looks it up by class name:
++ * ExtensionFoundation's +[NSDictionary _EX_dictionaryWithSignedURL:] reads
++ * signed caches (the extension point cache) only after asking AMFI whether
++ * the file's cdhash is in the trust cache. Without an answer, sandboxed
++ * readers (lsd) get no extension point cache, so MobileInstallation rejects
++ * every app extension ("Extension cache does not have an entry for ..."),
++ * LaunchServices registers none, and e.g. PosterBoard finds no poster
++ * providers (black wallpaper).
++ *
++ * User client, IOConnectCallMethod:
++ *   6 trust cache query  [1] + struct cdhash -> 0 (trusted)
++ * Every cdhash is trusted: code signing is not enforced here anyway, and
++ * there is no trust cache to look in. Other selectors are logged once and
++ * answered kIOReturnUnsupported, which is what their callers already got
++ * from the missing service. Boot-arg sweetamfi=0 leaves the service out.
++ *
++ * From ios-flame (NWylynko/ios-flame, MIT for its additions; this file is
++ * part of XNU, APSL 2.0) patch 0103, unchanged. guacamole had the same
++ * symptom: PosterBoard saw only the Weather poster and crash-looped.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <pexpert/pexpert.h>
++
++class AppleMobileFileIntegrity : public IOService {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrity);
++
++public:
++	IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrity, IOService);
++
++IOService *
++AppleMobileFileIntegrity::probe(IOService *provider, SInt32 *score)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("sweetamfi", &on, sizeof(on));
++	return on ? IOService::probe(provider, score) : NULL;
++}
++
++bool
++AppleMobileFileIntegrity::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleMobileFileIntegrityUserClient");
++	registerService();
++	IOLog("SWEET AMFI: AppleMobileFileIntegrity published (trust cache queries answer trusted)\n");
++	return true;
++}
++
++class AppleMobileFileIntegrityUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrityUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrityUserClient, IOUserClient);
++
++IOReturn
++AppleMobileFileIntegrityUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
++{
++	static uint32_t logged;	/* one line per selector */
++	if (selector == 6) {
++		if (!(logged & (1u << 6))) {
++			logged |= 1u << 6;
++			IOLog("SWEET AMFI: trust cache query (%u-byte cdhash): trusted\n", args->structureInputSize);
++		}
++		return kIOReturnSuccess;
++	}
++	if (selector < 32 && !(logged & (1u << selector))) {
++		logged |= 1u << selector;
++		IOLog("SWEET AMFI: selector %u (in %u/%u) unsupported\n", selector, args->scalarInputCount,
++		    args->structureInputSize);
++	}
++	return kIOReturnUnsupported;
++}
++#endif
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..8cca326 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = AppleMobileFileIntegrity;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleMobileFileIntegrity;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"

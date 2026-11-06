@@ -1,0 +1,72 @@
+guacamole build glue: new sources in bsd/conf/files and iokit/conf/files.arm64, bsd_init hooks
+
+Squashed from (in order):
+  0089-guacamole-gpu-stage1-probe
+  0111-guacamole-sweetbox-mailbox
+  0115-guacamole-sweetbox-root-install
+  0117-guacamole-redwood-gpu-user-client
+  0133-guacamole-pm8150-rtc
+  0137-guacamole-amfi-trust-query
+  0138-guacamole-pmem-rpmh
+  0139-guacamole-en0-apple80211-wifid
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..99a2689 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,7 +110,16 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_pmem.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_mailbox.c			standard
++bsd/dev/sweet_rtc.c			standard
++bsd/dev/redwood_sta.c		standard
++bsd/dev/redwood_net.c		standard
++bsd/dev/redwood_apple80211.c	standard
++bsd/dev/flame_sta.c		standard
++bsd/dev/flame_wlan.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..79817d3 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -950,6 +950,19 @@ bsd_init(void)
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* SWEETBOX ROOT/ entries (boot-args sweetmailbox=1 sweetboxroot=1), before launchd. */
++	extern void sweet_mailbox_root_install(void);
++	sweet_mailbox_root_install();
++	/* Wall clock from the PM8150 RTC + our offset file on the root (0133). */
++	extern void sweet_rtc_init(void);
++	sweet_rtc_init();
++	extern void sweet_pmem_init(void);
++	sweet_pmem_init();       /* 0138: /dev/pmem with sweetpmem=1 (bsd/dev/sweet_pmem.c) */
++	extern void flame_wlan_init(void);
++	flame_wlan_init();       /* 0139: /dev/wlan, en0 + Apple80211 for wifid (bsd/dev/flame_wlan.c) */
++#endif
++
+ 
+ #if CONFIG_NETBOOT
+ 	if (netboot) {
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..167418f 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,10 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
++iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
++iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitcpp
++iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp

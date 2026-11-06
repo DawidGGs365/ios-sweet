@@ -1,39 +1,132 @@
-diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
-index 4da50d8..8a80720 100644
---- a/bsd/dev/sweet_rpmh.c
-+++ b/bsd/dev/sweet_rpmh.c
-@@ -234,7 +234,7 @@ rh_send(uint32_t address, unsigned mv)
- 		for (unsigned c = 0; c < rh_ncpt; ++c) {
- 			if ((enabled & (1u << c)) &&
- 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
--				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
-+				printf("SWEET RPMH: conflicting inherited request for %#x in TCS%u\n", address, t);
- 				return EBUSY;
+guacamole input: PM8150 keys, S6SY761 touch (GENI FIFO I2C on SE17), HID bounds/edge
+
+Squashed from (in order):
+  0084-guacamole-pm8150-keys
+  0085-guacamole-s6sy761-touch
+  0086-guacamole-touch-hwcg-branch
+  0087-guacamole-touch-bounds-edge
+
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a148608..c70f60a 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,6 +1,10 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+  * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
++ * GUACAMOLE (OnePlus 7 Pro, PM8150): power = PON KPDPWR (SID0 0x810 bit0),
++ * volume-up = PM8150 GPIO6 (SID0 periph 0xc5), volume-down = PM8150 GPIO7
++ * (periph 0xc6, gpio-keys in the live DT) OR PON RESIN (bit1, qcom,pon_2
++ * linux,code 114 in the same DT); both GPIOs are active low.
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -21,11 +25,13 @@ void sweet_keys_init(void);
+ #define KEYS_OBS_PA      0x0e600000u
+ #define KEYS_CNFG_PA     0x0c40a000u
+ #define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
++#define KEYS_VUP_RT      0xc510u    /* PM8150 GPIO6 INT_RT_STS */
++#define KEYS_VDN_RT      0xc610u    /* PM8150 GPIO7 INT_RT_STS */
+ #define KEYS_NO_APID     0xffffu
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+-static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
++static uint16_t keys_pon_apid = KEYS_NO_APID, keys_vup_apid = KEYS_NO_APID,
++    keys_vdn_apid = KEYS_NO_APID;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+@@ -98,23 +104,31 @@ keys_thread(void *arg, wait_result_t result)
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+-		uint8_t pon = 0, gpio = 0;
++		uint8_t pon = 0, vup = 0xff, vdn = 0xff;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+-		if (!pok || !gok) {
++		bool uok = keys_read(keys_vup_apid, KEYS_VUP_RT, &vup);
++		bool dok = keys_read(keys_vdn_apid, KEYS_VDN_RT, &vdn);
++		/* 0 power, 1 volume up, 2 volume down (sweet_hid_key numbering) */
++		int now[3] = {
++			pok && (pon & 1u),
++			uok && !(vup & 1u),
++			(pok && (pon & 2u)) || (dok && !(vdn & 1u)),
++		};
++		bool ok[3] = {pok, uok, pok || dok};
++		if (!pok || (keys_vup_apid != KEYS_NO_APID && !uok) ||
++		    (keys_vdn_apid != KEYS_NO_APID && !dok)) {
+ 			if ((errors++ % 250u) == 0) {
+-				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+-				    pok, gok, keys_last_status);
++				printf("SWEET KEYS: read error pon-ok=%d vup-ok=%d vdn-ok=%d arb-status=%#x\n",
++				    pok, uok, dok, keys_last_status);
+ 			}
+ 		} else {
+ 			errors = 0;
+ 		}
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
++			if (ok[k] && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+-				    k, state[k], pon, gpio);
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio6=%#x gpio7=%#x\n",
++				    k, state[k], pon, vup, vdn);
+ 				sweet_hid_key(k, state[k]);
  			}
  		}
-@@ -320,7 +320,7 @@ rh_send(uint32_t address, unsigned mv)
- 		return EIO;
+@@ -152,24 +166,31 @@ sweet_keys_init(void)
+ 		return;
  	}
- 	rh_poisoned = false;
--	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
-+	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
- 	return 0;
- }
- 
-@@ -328,8 +328,9 @@ int
- sweet_rpmh_vreg_enable(const char *res, unsigned mv)
- {
- 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
--	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
--		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
-+	/* GUACAMOLE: the touch rail is pm8150 L17A, DT range 2856..3008 mV. */
-+	if (!res || strcmp(res, "ldoa17") || mv < 2856 || mv > 3008) {
-+		printf("SWEET RPMH: expected ldoa17 and 2856..3008 mV\n");
- 		return EINVAL;
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
+-	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
++	keys_vup_apid = keys_find_apid(0x0c5, count);
++	keys_vdn_apid = keys_find_apid(0x0c6, count);
++	uint8_t pon = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+-	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u pon=%#x/%d gpio6-apid=%u gpio7-apid=%u\n",
++	    keys_version, count, keys_pon_apid, pon, pok, keys_vup_apid, keys_vdn_apid);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+-	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+-	    mode & 3u : (mode >> 4) & 7u;
+-	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+-		keys_gpio_apid = KEYS_NO_APID;
++	uint16_t *apids[2] = {&keys_vup_apid, &keys_vdn_apid};
++	for (int g = 0; g < 2; ++g) {
++		uint16_t base = (uint16_t)(0xc500u + 0x100u * (unsigned)g);
++		uint8_t st = 0, mode = 0, en = 0, subtype = 0;
++		bool rok = keys_read(*apids[g], base + 0x10u, &st);
++		bool mok = keys_read(*apids[g], base + 0x40u, &mode);
++		bool eok = keys_read(*apids[g], base + 0x46u, &en);
++		bool sok = keys_read(*apids[g], base + 0x05u, &subtype);
++		unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
++		    mode & 3u : (mode >> 4) & 7u;
++		printf("SWEET KEYS: gpio%d rt=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d dir=%u\n",
++		    6 + g, st, rok, mode, mok, en, eok, subtype, sok, dir);
++		if (!rok || !eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
++			printf("SWEET KEYS: gpio%d not confirmed enabled as input; withheld, PMIC unchanged\n", 6 + g);
++			*apids[g] = KEYS_NO_APID;
++		}
  	}
- 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+-	if (!pok && !gok) {
++	if (!pok && keys_vup_apid == KEYS_NO_APID && keys_vdn_apid == KEYS_NO_APID) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 03defe6..a2cdfd0 100644
+index 03defe6..760d23d 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -1,9 +1,14 @@
@@ -152,7 +245,7 @@ index 03defe6..a2cdfd0 100644
  	} else {
  		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
  		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
-@@ -160,7 +191,8 @@ touch_clocks(void)
+@@ -160,13 +191,23 @@ touch_clocks(void)
  			return false;
  		}
  	}
@@ -160,9 +253,28 @@ index 03defe6..a2cdfd0 100644
 +	/* M_AHB, S_AHB, S0 branch halt bits (BRANCH_HALT_VOTED in Linux). */
 +	const uint32_t branches[] = {0x1e004, 0x1e008, 0x1e144};
  	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
- 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
- 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
-@@ -218,7 +250,7 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+-			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+-			    touch_rd(st.gcc, branches[i]));
+-			return false;
++		if (touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
++			continue;
+ 		}
++		uint32_t v = touch_rd(st.gcc, branches[i]);
++		/* S_AHB has hardware clock gating (Linux: hwcg_reg 0x1e008, bit 1).
++		 * In HWCG mode CLK_OFF follows bus activity, so Linux skips the halt
++		 * check (branch_in_hwcg_mode); do the same. */
++		if (branches[i] == 0x1e008u && (v & 2u)) {
++			printf("SWEET TOUCH: GCC branch %#x in HW gating mode (%#x); not polled\n",
++			    branches[i], v);
++			continue;
++		}
++		printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i], v);
++		return false;
+ 	}
+ 	return true;
+ }
+@@ -218,7 +259,7 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
  		return EIO;
  	}
  	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
@@ -171,7 +283,7 @@ index 03defe6..a2cdfd0 100644
  		return EBUSY;
  	}
  	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
-@@ -317,54 +349,6 @@ touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
+@@ -317,54 +358,6 @@ touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
  	return touch_msg(addr, NULL, 0, buf, len, false);
  }
  
@@ -226,7 +338,7 @@ index 03defe6..a2cdfd0 100644
  static void
  touch_report(uint32_t mask, const int *x, const int *y)
  {
-@@ -384,104 +368,91 @@ touch_report(uint32_t mask, const int *x, const int *y)
+@@ -384,104 +377,91 @@ touch_report(uint32_t mask, const int *x, const int *y)
  }
  
  static int
@@ -312,14 +424,14 @@ index 03defe6..a2cdfd0 100644
 -		mask |= 1u << id;
 -		x[id] = (int)px;
 -		y[id] = (int)py;
--	}
--	err = touch_goodix_ack();
--	if (!err) {
--		touch_report(mask, x, y);
 +		*mask |= 1u << tid;
 +		x[tid] = (int)px;
 +		y[tid] = (int)py;
  	}
+-	err = touch_goodix_ack();
+-	if (!err) {
+-		touch_report(mask, x, y);
+-	}
 -	return err;
 +	return 0;
  }
@@ -398,7 +510,7 @@ index 03defe6..a2cdfd0 100644
  	}
  	touch_report(mask, x, y);
  	return 0;
-@@ -492,7 +463,7 @@ touch_se_init(void)
+@@ -492,7 +472,7 @@ touch_se_init(void)
  {
  	uint32_t fw = touch_rd(st.se, SE_FW);
  	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
@@ -407,7 +519,7 @@ index 03defe6..a2cdfd0 100644
  	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
  	    touch_rd(st.se, 0x908));
  	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
-@@ -502,7 +473,7 @@ touch_se_init(void)
+@@ -502,7 +482,7 @@ touch_se_init(void)
  		return false;
  	}
  	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
@@ -416,7 +528,7 @@ index 03defe6..a2cdfd0 100644
  		return false;
  	}
  	touch_wr(st.se, 0xe18, 0); /* no GSI events */
-@@ -515,7 +486,7 @@ touch_se_init(void)
+@@ -515,7 +495,7 @@ touch_se_init(void)
  	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
  	touch_wr(st.se, 0x24, 0x7f);
  	touch_wr(st.se, 0x20, 1);
@@ -425,7 +537,7 @@ index 03defe6..a2cdfd0 100644
  	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
  	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
  	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
-@@ -558,64 +529,75 @@ touch_thread(void *arg, wait_result_t result)
+@@ -558,64 +538,75 @@ touch_thread(void *arg, wait_result_t result)
  	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
  	printf("SWEET TOUCH: starting in %u s\n", delay_s);
  	touch_wait(delay_s * 1000u);
@@ -541,9 +653,18 @@ index 03defe6..a2cdfd0 100644
  				if ((errors++ % 100u) == 0) {
  					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
-index 27bc49d..8a3fbac 100644
+index 27bc49d..83a81c3 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -355,7 +355,7 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * (_UIEventHIDTouchEdgeTypeForHIDEvent); without it there is no home or
+  * app-switcher gesture.
+  */
+-#define SWEET_TOUCH_EDGE_PX 48
++#define SWEET_TOUCH_EDGE_PX 63	/* GUACAMOLE: ~3 mm at 516 ppi (sweet: 48 @395) */
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
 @@ -432,16 +432,17 @@ SweetHIDTouch::start(IOService *provider)
  	if (!fLock || !IOHIDEventService::start(provider)) {
  		return false;
@@ -570,3 +691,33 @@ index 27bc49d..8a3fbac 100644
  	gSweetTouch = this;
  	registerService();
  	IOLog("SWEET HID: touch registered\n");
+@@ -458,12 +459,15 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	/* GUACAMOLE: clamp to the 1440x3120 panel, not sweet's 1080x2400 (that
++	 * clamp hid the right quarter and the bottom quarter of the screen,
++	 * including the home-indicator swipe). */
++	x = x < 0 ? 0 : (x > fLogicalW - 1 ? fLogicalW - 1 : x);
++	y = y < 0 ? 0 : (y > fLogicalH - 1 ? fLogicalH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
++	/* Panel pixels -> normalised display coordinates (whole panel = whole display). */
+ 	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+ 	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+@@ -472,8 +476,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fLogicalW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > fLogicalH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);

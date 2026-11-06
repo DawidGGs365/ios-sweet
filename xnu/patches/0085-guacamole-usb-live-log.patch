@@ -1,42 +1,8 @@
-diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
-index 82be4e1..b6b663e 100644
---- a/bsd/dev/sweet_rpmh.c
-+++ b/bsd/dev/sweet_rpmh.c
-@@ -417,10 +417,30 @@ sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uin
- int
- sweet_rpmh_vreg_enable(const char *res, unsigned mv)
- {
--	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
--	/* GUACAMOLE: the touch rail is pm8150 L17A, DT range 2856..3008 mV. */
--	if (!res || strcmp(res, "ldoa17") || mv < 2856 || mv > 3008) {
--		printf("SWEET RPMH: expected ldoa17 and 2856..3008 mV\n");
-+	/*
-+	 * Board-specific helper: do not apply PMIC5-LDO policy to arbitrary
-+	 * resources. Only these PMIC5 LDOs, at their DT voltages:
-+	 * ldoa17 PM8150 L17A (touch AVDD, DT 2856..3008 mV);
-+	 * USB HS PHY (hsphy@88e2000, sweet_usb.c live log): ldoa5 vdd 0.88 V,
-+	 * ldoa12 vdda18 1.8 V, ldoa2 vdda33 3.072 V.
-+	 */
-+	static const struct {
-+		const char *res;
-+		unsigned min, max;
-+	} allowed[] = {
-+		{ "ldoa17", 2856, 3008 },
-+		{ "ldoa5", 880, 880 },
-+		{ "ldoa12", 1704, 1800 },
-+		{ "ldoa2", 3050, 3300 },
-+	};
-+	bool ok = false;
-+	for (unsigned i = 0; res != NULL && i < sizeof(allowed) / sizeof(allowed[0]); i++) {
-+		if (strcmp(res, allowed[i].res) == 0 && mv >= allowed[i].min && mv <= allowed[i].max) {
-+			ok = true;
-+		}
-+	}
-+	if (!ok) {
-+		printf("SWEET RPMH: %s %u mV is not an allowed rail/voltage\n", res ? res : "(null)", mv);
- 		return EINVAL;
- 	}
- 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+guacamole USB live log: SM8150 USB clocks, SNPS femto PHY power-up, ECM live log
+
+Squashed from (in order):
+  0144-guacamole-usb-live-log-from-unixnu
+
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
 index b6c1a41..4205589 100644
 --- a/bsd/dev/sweet_usb.c

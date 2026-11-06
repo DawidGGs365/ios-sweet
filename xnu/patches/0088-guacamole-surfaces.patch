@@ -1,0 +1,606 @@
+guacamole IOSurface: SweetSurface wrap/zero-copy/10-bit, WebKit memory limit
+
+Squashed from (in order):
+  0123-guacamole-sweetsurface-refuse-zero-lock-result
+  0124-guacamole-sweetsurface-10bit-as-bgra
+  0125-guacamole-sweetsurface-wrap-client
+  0126-guacamole-sweetsurface-watch-log
+  0127-guacamole-sweetsurface-watch-bytes
+  0128-guacamole-sweetsurface-watch-user-stack
+  0129-guacamole-sweetsurface-create-at-address
+  0130-guacamole-sweetsurface-wrap-read-only
+  0131-guacamole-zero-copy-surfaces
+  0140-guacamole-webkit-surface-log
+  0141-guacamole-webkit-gpu-keeps-10bit
+  0142-guacamole-webkit-memlimit
+  0143-guacamole-webkit-b3a8-one-plane
+
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+index 1750d3a..c70bf5a 100644
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -4244,6 +4244,34 @@ memorystatus_on_ledger_footprint_exceeded(boolean_t warning, boolean_t memlimit_
+ 	}
+ #endif /* VM_PRESSURE_EVENTS */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET (0142): WebKit's processes outgrow the limits jetsam gives them here (Safari wifi30:
++	 * com.apple.WebKit.GPU started 9 times, killed with reason 7 = per-process limit, before it
++	 * drew a page tile): every IOSurface is wired memory mapped into the task (SweetSurface), so
++	 * its 1125 x 1905 tiles count in full. For com.apple.WebKit.* the limit goes up to 2 GB,
++	 * not fatal, instead of a kill. Boot-arg sweetwkmem=0 keeps the stock behaviour.
++	 */
++	if (memlimit_is_fatal) {
++		static int wkmem = -1;
++		if (wkmem < 0) {
++			int v = 1;
++			PE_parse_boot_argn("sweetwkmem", &v, sizeof(v));
++			wkmem = v;
++		}
++		char name[MAXCOMLEN + 1] = "";
++		proc_selfname(name, sizeof(name));
++		if (wkmem && strncmp(name, "com.apple.WebKit", 16) == 0) {
++			memorystatus_memlimit_properties_t raised = { 2048, 0, 2048, 0 };
++			int err = memorystatus_set_memlimit_properties(proc_getpid(p), &raised);
++			printf("SWEET MEM: %s[%d] over its limit: raised to 2048 MB, not fatal (%d)\n", name, proc_getpid(p), err);
++			if (err == 0) {
++				return;
++			}
++		}
++	}
++#endif
++
+ 	if (memlimit_is_fatal) {
+ 		/*
+ 		 * If this process has no high watermark or has a fatal task limit, then we have been invoked because the task
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..5a3c85f 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -38,11 +38,14 @@
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
++#include <kern/backtrace.h>
+ #include <sys/proc.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceWrapClientImage    = 6,
++	kSweetSurfaceWrapClientMemory   = 7,
+ 	kSweetSurfaceLimits             = 13,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+@@ -84,6 +87,9 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (wrapped && memory != NULL) {
++		memory->complete();
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -98,7 +104,9 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		/* a task's own (cached) memory keeps its cache mode: no WC alias */
++		kernelMap = memory->map((wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache) |
++		    (readOnly ? kIOMapReadOnly : 0));
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -288,6 +296,41 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+ 	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	/*
++	 * 10-bit wide-colour formats the iPhone X userland asks for ('w30r',
++	 * 'l10r', 'w30R', and 'b3a8' with its separate alpha plane) become
++	 * one-plane BGRA: the panel is 8-bit sRGB, the display path copies 4-byte
++	 * BGRA pixels, and the GL renderer (userland/gpu/eagl.c) can only draw
++	 * into BGRA. The client reads the format back from the lock result and
++	 * draws accordingly. G4 run gl3: CoreAnimation's screen surface was
++	 * 'b3a8', eagl.c could not attach it, every frame went nowhere (black).
++	 * From topaz (MakrSas/ios-topaz) 0900, which took it from HackiOS; APSL.
++	 * Boot-arg sweetsurf10=1 keeps the formats as asked.
++	 */
++	bool one_plane = false;
++	static int keep10 = -1;
++	if (keep10 < 0) {
++		int v = 0;
++		keep10 = PE_parse_boot_argn("sweetsurf10", &v, sizeof(v)) ? v : 0;
++	}
++	/*
++	 * 0141: sweetsurf10=3 keeps the 10-bit formats for WebKit's GPU process only. It draws
++	 * Safari's page tiles ('w30r', 'b3a8') and leaves every remapped one empty (0140, wifi27/29:
++	 * "pixels set 0"), while the BGRA surfaces it asks for get pixels.
++	 */
++	char who10[32] = "";
++	if (keep10 == 3) {
++		proc_selfname(who10, sizeof(who10));
++	}
++	if (keep10 == 0 || (keep10 == 3 && strcmp(who10, "com.apple.WebKit.GPU") != 0)) {
++		if (s->pixelFormat == 0x77333072u || s->pixelFormat == 0x6C313072u ||
++		    s->pixelFormat == 0x77333052u) {
++			s->pixelFormat = 0x42475241u;           /* 'BGRA' */
++		} else if (s->pixelFormat == 0x62336138u) {
++			s->pixelFormat = 0x42475241u;
++			one_plane = true;
++		}
++	}
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
+@@ -301,7 +344,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;
+@@ -335,6 +378,29 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 		}
+ 		s->planeCount = planes->getCount();
+ 	}
++	/*
++	 * 0143: a 'b3a8' made one-plane BGRA kept no plane at all, so IOSurfaceGetBytesPerRowOfPlane(0)
++	 * was 0 for it. WebKit's GPU process builds CGImages from plane 0 of its 'b3a8' tiles: 526
++	 * "CGImageCreate: invalid image bits/pixel or bytes/row" in one Safari session (jb1), pages
++	 * black. For WebKit's processes that plane is the whole BGRA surface (backboardd's GL path
++	 * keeps the plane-less layout it was written for).
++	 */
++	if (one_plane && s->planeCount == 0) {
++		char who[32] = "";
++		proc_selfname(who, sizeof(who));
++		if (strncmp(who, "com.apple.WebKit", 16) == 0) {
++			struct sweet_surface_plane *p = &s->planes[0];
++			p->width = s->width;
++			p->height = s->height;
++			p->bytesPerElement = s->bytesPerElement;
++			p->elementWidth = s->elementWidth;
++			p->elementHeight = s->elementHeight;
++			p->bytesPerRow = s->bytesPerRow;
++			p->offset = s->offset;
++			p->size = s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++			s->planeCount = 1;
++		}
++	}
+ 
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+ 	if (alloc < end) {
+@@ -410,6 +476,7 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
++	IOReturn wrapClient(uint32_t selector, IOExternalMethodArguments *args);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -430,6 +497,111 @@ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+ 
+ static uint64_t sweet_surf_logged;      /* selectors / traps already logged (< 64) */
+ 
++/*
++ * Boot-arg sweetsurflog=WxH: what every task does with surfaces of that size
++ * (mapped by create/lookup/wrap, port made, lock, unlock), at most 200 lines.
++ * G4 run gl8: the home screen's icons are 180 x 180 surfaces backboardd makes
++ * for CoreAnimation's deferred image slots, and they stay all zero.
++ */
++static void
++sweet_surf_watch(const char *what, SweetSurface *s, uint64_t extra)
++{
++	static int parsed;
++	static uint32_t want_w, want_h, lines;
++	if (!parsed) {
++		char spec[32] = "";
++		parsed = 1;
++		if (PE_parse_boot_arg_str("sweetsurflog", spec, sizeof(spec))) {
++			const char *x = strchr(spec, 'x');
++			want_w = (uint32_t)strtoul(spec, NULL, 10);
++			want_h = x != NULL ? (uint32_t)strtoul(x + 1, NULL, 10) : 0;
++		}
++	}
++	if (want_w == 0 || s == NULL || s->width != want_w || s->height != want_h || lines >= 200) {
++		return;
++	}
++	lines++;
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	/* 0127: how much of the pixels is not zero now (what a lock for writing left there) */
++	uint64_t set = 0, size = (uint64_t)s->bytesPerRow * s->height;
++	const uint8_t *pixels = (const uint8_t *)s->kernelAddress();
++	if (pixels != NULL && s->memory != NULL && size <= s->memory->getLength()) {
++		pixels += s->wrapDelta;
++		for (uint64_t i = 0; i < size; i++) {
++			set += pixels[i] != 0;
++		}
++	}
++	IOLog("SWEET SURF: watch %s %s id %u seed %u %#llx: %llu of %llu bytes set\n", name, what, s->id,
++	    s->state != NULL ? *(uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED) : 0,
++	    (unsigned long long)extra, (unsigned long long)set, (unsigned long long)size);
++	/*
++	 * 0128: and for a lock or unlock, who in the task asked (its user stack, raw addresses:
++	 * subtract the dyld cache slide libsweet-bbd logs). Interposing IOSurfaceLock in
++	 * backboardd did not catch CoreAnimation's write lock of the icon surfaces (gl11).
++	 */
++	if (strncmp(what, "lock", 4) == 0 || strncmp(what, "unlock", 6) == 0) {
++		uintptr_t frames[10];
++		struct backtrace_user_info info = BTUINFO_INIT;
++		unsigned int n = backtrace_user(frames, 10, NULL, &info);
++		char chain[200];
++		size_t used = 0;
++		chain[0] = 0;
++		for (unsigned int i = 0; i < n && used < sizeof(chain); i++) {
++			used += (size_t)snprintf(chain + used, sizeof(chain) - used, " %#lx", (unsigned long)frames[i]);
++		}
++		IOLog("SWEET SURF: watch %s %s id %u from%s\n", name, what, s->id, chain);
++	}
++}
++
++/*
++ * 0140: Safari's page area stays black (wifi25/26) while its own UI draws. Who in WebKit makes
++ * which surfaces, who maps them later (backboardd? MobileSafari?), and whether WebContent's
++ * pixels are there when it unlocks: at most 240 lines. The first 64 creates of the boot are
++ * all logged anyway, WebKit's processes start after them.
++ */
++static uint32_t sweet_wk_ids[64];
++static uint32_t sweet_wk_n, sweet_wk_lines;
++
++static bool
++sweet_wk_proc(char *name, size_t len)
++{
++	proc_selfname(name, (int)len);
++	return strncmp(name, "com.apple.WebKit", 16) == 0 || strcmp(name, "MobileSafari") == 0;
++}
++
++static void
++sweet_wk_log(const char *what, SweetSurface *s, IOReturn ret)
++{
++	char name[32];
++	bool wk = sweet_wk_proc(name, sizeof(name));
++	bool known = false;
++	for (uint32_t i = 0; s != NULL && i < sweet_wk_n && i < 64; i++) {
++		known |= sweet_wk_ids[i] == s->id;
++	}
++	if ((!wk && !known) || s == NULL || sweet_wk_lines >= 240) {
++		return;
++	}
++	if (wk && !known && strcmp(what, "create") == 0 && sweet_wk_n < 64) {
++		sweet_wk_ids[sweet_wk_n++] = s->id;
++	}
++	uint64_t set = 0, size = 0;
++	if (strcmp(what, "unlock") == 0 && s->memory != NULL) {
++		size = (uint64_t)s->bytesPerRow * s->height;
++		const uint8_t *pixels = (const uint8_t *)s->kernelAddress();
++		if (pixels != NULL && size <= s->memory->getLength()) {
++			pixels += s->wrapDelta;
++			for (uint64_t i = 0; i < size; i += 4) {
++				set += *(const uint32_t *)(const void *)(pixels + i) != 0;
++			}
++		}
++	}
++	sweet_wk_lines++;
++	IOLog("SWEET SURF: wk %s %s id %u %ux%u fmt 0x%x bpr %u -> 0x%x%s pixels set %llu of %llu\n", name, what,
++	    s->id, s->width, s->height, s->pixelFormat, s->bytesPerRow, ret, known && !wk ? " (a WebKit surface)" : "",
++	    (unsigned long long)set, (unsigned long long)(size / 4));
++}
++
+ static void
+ sweet_surf_log_once(const char *what, uint32_t n)
+ {
+@@ -527,7 +699,8 @@ IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache |
++	    (s->readOnly ? kIOMapReadOnly : 0));
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+ 		ref->release();
+@@ -567,7 +740,7 @@ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+ 	bzero(out, SWEET_SURFACE_RESULT_SIZE);
+-	put64(out, 0x00, ref->data->getAddress());
++	put64(out, 0x00, ref->data->getAddress() + s->wrapDelta);
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+@@ -628,6 +801,8 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+ 	if (ret != kIOReturnSuccess) {
+ 		return ret;
+ 	}
++	sweet_surf_watch(existing ? "map (already)" : "map", s, ref->data->getAddress());
++	sweet_wk_log(existing ? "map (already)" : "map", s, kIOReturnSuccess);
+ 	uint8_t *out = (uint8_t *)IOMallocZeroData(SWEET_SURFACE_RESULT_SIZE);
+ 	if (out == NULL) {
+ 		ret = kIOReturnNoMemory;
+@@ -646,6 +821,8 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+ 	return ret;
+ }
+ 
++static IOMemoryDescriptor *sweet_wrap_range(task_t task, uint64_t at, uint64_t length, bool *readOnly);
++
+ IOReturn
+ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ {
+@@ -684,7 +861,41 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	/*
++	 * 0129: "IOSurfaceAddress" asks for a surface around the caller's own memory.
++	 * CoreAnimation's GL renderer makes one so for an image whose format has no IOSurface
++	 * pixel format (CA::Render::Image::retain_iosurface: IOSurfaceCreate with the image's
++	 * data address, then only a lock and an unlock): the home screen's app icons. This used
++	 * to get fresh zeroed memory instead, and the icons were drawn from zeros (G4 runs
++	 * gl8-gl12). The range is wired for the surface's life, as for selectors 6 and 7.
++	 */
++	OSNumber *address = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	if (ret == kIOReturnSuccess && address != NULL && address->unsigned64BitValue() != 0) {
++		uint64_t at = address->unsigned64BitValue();
++		uint64_t need = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++		if (need == 0) {
++			need = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++		}
++		uint64_t first = trunc_page_64(at);
++		bool readOnly = false;
++		IOMemoryDescriptor *md = sweet_wrap_range(fTask, at, need, &readOnly);
++		if (md != NULL) {
++			s->memory = md;
++			s->wrapped = true;
++			s->readOnly = readOnly;
++			s->wrapDelta = (uint32_t)(at - first);
++			s->mapCache = kIOMapDefaultCache;
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		} else {
++			IOLog("SWEET SURF: create: IOSurfaceAddress %#llx: fresh memory instead\n", (unsigned long long)at);
++			address = NULL;
++		}
++	} else {
++		address = NULL;
++	}
++	if (ret == kIOReturnSuccess && address == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+@@ -711,6 +922,20 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
++	char wkname[32];
++	if (sweet_wk_proc(wkname, sizeof(wkname)) && sweet_wk_lines < 240) {
++		OSArray *pl = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++		OSDictionary *p0 = pl != NULL ? OSDynamicCast(OSDictionary, pl->getObject(0)) : NULL;
++		IOLog("SWEET SURF: wk %s asked fmt 0x%x %ux%u bpe %u bpr %u ew %u planes %u (0: bpe %u bpr %u %ux%u) -> bpe %u planes %u\n",
++		    wkname, sweet_dict_u32(props, "IOSurfacePixelFormat", 0), sweet_dict_u32(props, "IOSurfaceWidth", 0),
++		    sweet_dict_u32(props, "IOSurfaceHeight", 0), sweet_dict_u32(props, "IOSurfaceBytesPerElement", 0),
++		    sweet_dict_u32(props, "IOSurfaceBytesPerRow", 0), sweet_dict_u32(props, "IOSurfaceElementWidth", 0),
++		    pl != NULL ? pl->getCount() : 0, p0 != NULL ? sweet_dict_u32(p0, "IOSurfacePlaneBytesPerElement", 0) : 0,
++		    p0 != NULL ? sweet_dict_u32(p0, "IOSurfacePlaneBytesPerRow", 0) : 0,
++		    p0 != NULL ? sweet_dict_u32(p0, "IOSurfacePlaneWidth", 0) : 0,
++		    p0 != NULL ? sweet_dict_u32(p0, "IOSurfacePlaneHeight", 0) : 0, s->bytesPerElement, s->planeCount);
++	}
++	sweet_wk_log("create", s, ret);
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+ 		s->release();
+@@ -721,6 +946,123 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	return ret;
+ }
+ 
++/*
++ * 0130: wire [at, at + length) of task for a wrapped surface. Image data CoreAnimation got from
++ * a client is mapped read-only in backboardd, so wiring it for writing fails (gl13: every
++ * IOSurfaceAddress create "not wired"); then it is wired for reading only and *readOnly says
++ * so (the surface is mapped read-only everywhere).
++ */
++static IOMemoryDescriptor *
++sweet_wrap_range(task_t task, uint64_t at, uint64_t length, bool *readOnly)
++{
++	uint64_t first = trunc_page_64(at);
++	uint64_t size = round_page_64(at + length) - first;
++	IOReturn err = kIOReturnNoMemory;
++	for (int pass = 0; pass < 2; pass++) {
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(first, size,
++		    pass == 0 ? kIODirectionInOut : kIODirectionOut, task);
++		if (md == NULL) {
++			continue;
++		}
++		err = md->prepare(pass == 0 ? kIODirectionInOut : kIODirectionOut);
++		if (err == kIOReturnSuccess) {
++			*readOnly = pass == 1;
++			return md;
++		}
++		md->release();
++	}
++	IOLog("SWEET SURF: wrap %#llx (%llu bytes): not wired (%#x)\n", (unsigned long long)at,
++	    (unsigned long long)length, err);
++	return NULL;
++}
++
++/*
++ * IOSurfaceWrapClientImage (6, struct in of 0x20 bytes: +0 address, +8 width,
++ * +0xc height, +0x10 pixel format, +0x14 bytes per element, +0x18 bytes per
++ * row; layout read off iOS 16.7.16's IOSurfaceClientWrapClientImage) and
++ * IOSurfaceWrapClientMemory (7: scalars address, size): a surface made of the
++ * caller's own memory. CoreAnimation's GL renderer wraps images so, app icons
++ * among them (G4 run gl4: icons missing while 0123 refused these calls). The
++ * range stays prepared (wired) for as long as the surface lives; every task
++ * maps it as usual. From topaz (MakrSas/ios-topaz) 0132, APSL 2.0.
++ */
++IOReturn
++IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments *args)
++{
++	uint64_t address, size;
++	uint32_t width, height, format = 0, bpe, bpr;
++
++	if (selector == kSweetSurfaceWrapClientImage) {
++		const uint8_t *in = (const uint8_t *)args->structureInput;
++		if (in == NULL || args->structureInputSize < 0x1c) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&address, in, 8);
++		memcpy(&width, in + 0x08, 4);
++		memcpy(&height, in + 0x0c, 4);
++		memcpy(&format, in + 0x10, 4);
++		memcpy(&bpe, in + 0x14, 4);
++		memcpy(&bpr, in + 0x18, 4);
++		if (width == 0 || height == 0 || bpe == 0 || bpe > 16 || bpr < (uint64_t)width * bpe) {
++			return kIOReturnBadArgument;
++		}
++		size = (uint64_t)bpr * height;
++	} else {
++		if (args->scalarInputCount < 2) {
++			return kIOReturnBadArgument;
++		}
++		address = args->scalarInput[0];
++		size = args->scalarInput[1];
++		width = (uint32_t)size;
++		height = 1;
++		bpe = 1;
++		bpr = (uint32_t)size;
++	}
++	if (address == 0 || size == 0 || size > (256ull << 20)) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t first = trunc_page_64(address);
++	bool readOnly = false;
++	IOMemoryDescriptor *md = sweet_wrap_range(fTask, address, size, &readOnly);
++	if (md == NULL) {
++		return kIOReturnVMError;
++	}
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		md->complete();
++		md->release();
++		return kIOReturnNoMemory;
++	}
++	s->memory = md;
++	s->wrapped = true;
++	s->readOnly = readOnly;
++	s->wrapDelta = (uint32_t)(address - first);
++	s->mapCache = kIOMapDefaultCache;
++	s->width = width;
++	s->height = height;
++	s->pixelFormat = format;
++	s->bytesPerElement = (uint16_t)bpe;
++	s->elementWidth = 1;
++	s->elementHeight = 1;
++	s->bytesPerRow = bpr;
++	s->allocSize = (uint32_t)size;
++	s->planeCount = 0;
++	if (!sweet_surface_publish(s)) {
++		s->release();
++		return kIOReturnNoResources;
++	}
++	static uint32_t logged;
++	if (logged < 8) {
++		logged++;
++		IOLog("SWEET SURF: wrap %s id %u %ux%u fmt 0x%x bpe %u bpr %u size %llu at +0x%x\n",
++		    selector == kSweetSurfaceWrapClientImage ? "image" : "memory", s->id, width, height,
++		    format, bpe, bpr, size, s->wrapDelta);
++	}
++	IOReturn ret = returnSurface(s, args);  /* takes the creator's user count */
++	s->release();
++	return ret;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -739,6 +1081,10 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	}
+ 	case kSweetSurfaceCreate:
+ 		return create(args);
++	case kSweetSurfaceWrapClientImage:
++	case kSweetSurfaceWrapClientMemory:
++		sweet_surf_log_once("sel", selector);
++		return wrapClient(selector, args);
+ 	case kSweetSurfaceLookup: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		IOReturn ret = kIOReturnNotFound;
+@@ -768,11 +1114,28 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		}
+ 		args->scalarOutput[0] = sweet_surface_port_in_task(s, fTask);
+ 		args->scalarOutputCount = 1;
++		sweet_surf_watch("port", s, args->scalarOutput[0]);
+ 		s->release();
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
+ 	default:
++		/*
++		 * A call that answers with a lock result (wrap client image 6 and
++		 * memory 7) must not succeed with zeroes: IOSurface.framework builds
++		 * a client from it with no shared state page, and CoreAnimation's
++		 * GL renderer then reads the EDR factor there
++		 * (IOSurfaceClientGetBulkAttachments, client+0x70 = 0): backboardd
++		 * crashed at 0x30, 108 times (G4 run gl2). Refused, the framework
++		 * returns NULL and CoreAnimation takes its other path. From topaz
++		 * (MakrSas/ios-topaz) 0131, same SweetSurface lineage, APSL 2.0.
++		 */
++		if ((args->structureOutputDescriptor != NULL &&
++		    args->structureOutputDescriptor->getLength() >= SWEET_SURFACE_RESULT_SIZE) ||
++		    (args->structureOutput != NULL && args->structureOutputSize >= SWEET_SURFACE_RESULT_SIZE)) {
++			sweet_surf_log_once("sel (refused: lock result)", selector);
++			return kIOReturnUnsupported;
++		}
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 			args->scalarOutput[i] = 0;
+@@ -822,7 +1185,7 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+@@ -830,6 +1193,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 		return kIOReturnNotFound;
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
++	sweet_surf_watch("lock", s, (uintptr_t)options);
+ 	s->release();
+ 	return ret;
+ }
+@@ -844,6 +1208,8 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++	sweet_surf_watch("unlock", s, (uintptr_t)options);
++	sweet_wk_log("unlock", s, kIOReturnSuccess);
+ 	s->release();
+ 	return ret;
+ }
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..5ae37fb 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,8 +39,12 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
++	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
++	bool                      readOnly;     /* ... that the task may only read: mapped read-only */
++	uint32_t                  drawn;        /* RedwoodGPU: the last submission naming it (0: none) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { wrapDelta = 0; wrapped = false; readOnly = false; drawn = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
