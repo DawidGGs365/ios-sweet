@@ -1,0 +1,157 @@
+diff --color -ruN a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c	2026-11-06 14:23:58.037236256 +0100
++++ b/bsd/dev/sweet_spmi.c	2026-11-06 14:24:24.619449125 +0100
+@@ -3,7 +3,7 @@
+  * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+  * Init is serialized by the single built-in SweetBattery personality.
+- * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
++ * Battery APIDs are disjoint from the keys' PON/GPIO APIDs (PM8150 SID 0).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -86,11 +86,14 @@
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/* Restrict access to the charger/battery blocks; keys retain their own
++	 * lanes. SID 0: PM6150 SMB5 + QG (the Redmi template). SID 2: guacamole
++	 * PM8150B SMB5 (stock dtbo 18821 qcom,pm8150b@2: chgr 0x10, dcdc 0x11,
++	 * batif 0x12, usb 0x13, typec 0x15). */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	bool allowed = (peripheral >= 0x10 && peripheral <= 0x13) ||
++	    (sid == 0 && peripheral == 0x48) || (sid == 2 && peripheral == 0x15);
++	if (!sp_ready || !out || (sid != 0 && sid != 2) || addr > 0xffffu || !allowed) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --color -ruN a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-06 14:23:58.039521630 +0100
++++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-06 14:24:37.456826793 +0100
+@@ -2,9 +2,10 @@
+  * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+  * sweetbattery=1 (not used on guacamole): read-only SMB5 charger / BMS
+  * polling at SPMI SID 0, written for the Redmi's PM6150; voltage-derived
+- * SOC is an UNCALIBRATED estimate. Kept as the starting point for charger
+- * status on guacamole, whose PM8150B (SID 2) carries the same SMB5 charger
+- * block; the SID and offsets must be checked against the stock DT first.
++ * SOC is an UNCALIBRATED estimate. guacamole: bq27541 gauge for SOC, plus
++ * the read-only PM8150B SMB5 status (SPMI SID 2, same register map as the
++ * PM6150 one, verified against stock dtbo 18821 and smb5-reg.h) for the
++ * USB plug state and the charger state machine.
+  * guacamole: the bq27541 fuel gauge (bsd/dev/sweet_gfg.c) supplies real SOC,
+  * voltage, current, temperature, capacities and cycle count, polled every
+  * 30 s by default (sweetgfg=0 disables it).
+@@ -32,12 +33,14 @@
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal, fGauge, fGaugeGood, fGuac;
++	bool fTimerAdded, fRunning, fReal, fGauge, fGaugeGood, fGuac, fSmb;
++	uint8_t fSmbLast[4];
+ 	int fLastMode;
+ 	/* Published capacity model; sweet keeps the DT nominal 5020 mAh. */
+ 	unsigned fDesign, fMaxCap, fCycles;
+ 	int fCentiC;
+ 	bool fTempMeasured;
++	bool smbStatus(bool *plugged, bool *charging, bool *full);
+ 	struct sweet_gfg_sample fLast;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -62,7 +65,8 @@
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = fGauge = fGaugeGood = fGuac = false;
++	fTimerAdded = fRunning = fReal = fGauge = fGaugeGood = fGuac = fSmb = false;
++	fSmbLast[0] = fSmbLast[1] = fSmbLast[2] = fSmbLast[3] = 0xff;
+ 	fDesign = fMaxCap = 5020;
+ 	fCycles = 0;
+ 	fCentiC = 2500;
+@@ -219,6 +223,40 @@
+ 	return 100;
+ }
+ 
++/*
++ * guacamole PM8150B SMB5, read only (smb5-reg.h / smb5-lib.c):
++ *   0x1310 USBIN INT_RT_STS bit4 USBIN_PLUGIN (smblib_get_prop_usb_present)
++ *   0x110b POWER_PATH_STATUS: bit6 USBIN suspended, bit4 USE_USBIN, bit0 valid
++ *   0x1006 BATTERY_CHARGER_STATUS_1 bits2:0: 1 trickle 2 pre 3 full-on
++ *          4 taper 5 terminate (0 inhibit, 6 pause, 7 disabled)
++ *   0x1007 BATTERY_CHARGER_STATUS_2 bit1 BAT_OV
++ * During VOOC/Warp the external charger IC feeds the battery and the SMB5
++ * may be suspended, so "charging" also trusts the gauge current.
++ */
++bool
++SweetBattery::smbStatus(bool *plugged, bool *charging, bool *full)
++{
++	uint8_t usb, path, state, err;
++	if (!fSmb || sweet_spmi_read(2, 0x1310, &usb) || sweet_spmi_read(2, 0x110b, &path) ||
++	    sweet_spmi_read(2, 0x1006, &state) || sweet_spmi_read(2, 0x1007, &err)) {
++		return false;
++	}
++	*plugged = (usb & 0x10u) != 0;
++	unsigned st = state & 7u;
++	*charging = *plugged && st >= 1 && st <= 4 && !(err & 2u);
++	*full = *plugged && st == 5 && !(err & 2u);
++	if (usb != fSmbLast[0] || path != fSmbLast[1] || state != fSmbLast[2] || err != fSmbLast[3]) {
++		fSmbLast[0] = usb;
++		fSmbLast[1] = path;
++		fSmbLast[2] = state;
++		fSmbLast[3] = err;
++		IOLog("SWEET CHARGER: usb-rt %#x path %#x state %u err %#x -> %s%s\n",
++		    usb, path, st, err, *plugged ? "plugged" : "unplugged",
++		    *charging ? ", charging" : *full ? ", full" : "");
++	}
++	return true;
++}
++
+ void
+ SweetBattery::poll(void)
+ {
+@@ -250,7 +288,15 @@
+ 		fTempMeasured = true;
+ 		bool charging = b.ma > 20;
+ 		bool external = !b.discharging || charging;
+-		publish(b.soc, b.mv, b.ma, external, external, charging, b.full && external, true, true);
++		bool full = b.full && external;
++		bool plugged, smbCharging, smbFull;
++		if (smbStatus(&plugged, &smbCharging, &smbFull)) {
++			/* The PMIC plug bit is authoritative; the gauge current covers VOOC. */
++			external = plugged;
++			charging = plugged && (charging || smbCharging);
++			full = plugged && (smbFull || b.full);
++		}
++		publish(b.soc, b.mv, b.ma, external, external, charging, full, true, true);
+ 		if (polls == 4 || polls % 20 == 0) {
+ 			IOLog("SWEET BATTERY: gauge %u%% %umV %dmA %d.%02dC fcc %u rm %u cycles %u flags %#x\n",
+ 			    b.soc, b.mv, b.ma, b.centi_c / 100, (b.centi_c < 0 ? -b.centi_c : b.centi_c) % 100,
+@@ -258,6 +304,13 @@
+ 		}
+ 		return;
+ 	}
++	if (fGuac) {
++		/* No gauge (yet): static SOC, but the real plug state if readable. */
++		bool plugged = true, smbCharging = false, smbFull = true;
++		(void)smbStatus(&plugged, &smbCharging, &smbFull);
++		publish(100, 4200, 0, plugged, plugged, smbCharging, smbFull, false, false);
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -321,6 +374,10 @@
+ 	fGuac = gfg != -2;
+ 	/* guacamole keeps the timer even if the first gauge probe failed (retries). */
+ 	fReal = fGuac || (real == 1 && sweet_spmi_init() == 0);
++	/* guacamole PM8150B charger status; sweetcharger=0 turns it off. */
++	int smb = 1;
++	(void)PE_parse_boot_argn("sweetcharger", &smb, sizeof(smb));
++	fSmb = fGuac && smb && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {

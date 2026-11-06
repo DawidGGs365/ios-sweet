@@ -23,7 +23,7 @@ The boot chain, payload and board files for guacamole live in the companion repo
 | Alert slider | Ring/silent switch from TLMM gpio27/134/125 (0107); not tested yet |
 | Touch | Samsung S6SY761 on QUP SE17. SE17 is FIFO-locked by TrustZone, so it needs GPI DMA through an SMMU context bank. Not working yet; 0105 adds the S1 translation Linux uses |
 | GPU | Adreno 640 GMU firmware starts (0094 onwards) but aborted with 0xBADDFACE on the old HFI layout; 0105 fixes the layout. The HFI handshake (0106) and perf/bandwidth tables (0108) are not tested on hardware yet. No acceleration yet |
-| Battery | bq27541 fuel gauge over I²C SE8 (0103); reports to the IOPMPowerSource service |
+| Battery | bq27541 fuel gauge over I²C SE8 (0103); reports to the IOPMPowerSource service. USB plug and charger state from the PM8150B SMB5 at SPMI SID 2, read only (0112); not tested yet |
 | USB | Device mode with a CDC-ECM live log to the PC (`tools/sweet-usbnet.sh`) |
 | Haptics | Read-only probe of the PM8150B haptics block (0107); the AW8697 path needs working GPI first |
 | Missing | Wi-Fi, Bluetooth, cellular, audio, camera, sensors, SEP / Face ID, fingerprint |
@@ -47,7 +47,7 @@ sh tools/sweet-usbnet.sh ../logs/usb-sNNNN.log    # start the USB live-log liste
 fastboot boot ../unixnu-guacamole/out/guacamole/boot/boot-sNNNN-all.img
 ```
 
-Driver lines start with `SWEET <DRIVER>:` (TOUCH, GPU, KEYS, SLIDER, DSI, BACKLIGHT, BATTERY, RPMH, USB, HAPTICS).
+Driver lines start with `SWEET <DRIVER>:` (TOUCH, GPU, KEYS, SLIDER, DSI, BACKLIGHT, BATTERY, CHARGER, RPMH, USB, HAPTICS, SYS).
 
 ## Boot-args of the guacamole drivers
 
@@ -61,6 +61,7 @@ Driver lines start with `SWEET <DRIVER>:` (TOUCH, GPU, KEYS, SLIDER, DSI, BACKLI
 | `sweetdsi=0` | No DSI writes at all |
 | `sweetslider=0/2` | Alert slider off / inverted polarity |
 | `sweetkeys=0` | Button driver off |
+| `sweetcharger=0` | No PM8150B charger status reads (plug state then comes from the gauge current) |
 | `sweetusb=2`, `sweetusbrecap=1` | USB live log; recap thread for the last log lines |
 | `sweetfb_noconsole=1`, `sweetfb_hz=N`, `sweetfb_stretch=0` | No kernel text over the GUI; panel copy rate; native 1:1 instead of stretching |
 
@@ -83,13 +84,14 @@ Driver lines start with `SWEET <DRIVER>:` (TOUCH, GPU, KEYS, SLIDER, DSI, BACKLI
 | 0107 | Alert slider as the ring/silent switch; read-only haptics probe |
 | 0109 | One cached board check for all drivers; panel stretch without read-back; `SWEET SYS` CPU/RAM line |
 | 0110 | GPI: SMMU fault state around every doorbell, `sweetgpistop` |
+| 0112 | PM8150B charger status (USB plug, charge state) next to the gauge |
 | 0111 | guacamole only: Redmi touch ICs (GT9896, Focaltech), SM7150 USB offsets and QUSB2 dump, PM6150L keys and the L11C rail removed. The generic GENI FIFO I²C engine and the SMB5 charger reader stay as templates |
 
 ## guacamole hardware facts
 
 - RPMh BCM votes go through cmd-db (QUP0 `0x50080`, SN11 `0x5006c`). The GPU perf table uses the `gfx.lvl`, `cx.lvl` and `mx.lvl` ARC tables.
 - Touch: S6SY761 at I²C `0x48` on SE17 (`0xc80000`), GPI DMA on `0xc00000` gpii 1, apps-SMMU SID `0x7b6`, IOVA `0x100000`.
-- Fuel gauge: bq27541 at `0x55` on SE8 (`0xa80000`), gpio88/89.
+- Fuel gauge: bq27541 at `0x55` on SE8 (`0xa80000`), gpio88/89. Charger: PM8150B SMB5 at SPMI SID 2 (chgr `0x1000`, dcdc `0x1100`, usb `0x1300`, typec `0x1500`); VOOC/Warp uses a separate charger IC.
 - Panel: Samsung S6E3HC2 on DSI0 (`0xae94000`), command mode with DSC, brightness 1..1023.
 - GPU: GMU at `0x2c6a000`, GPU CC at `0x2c90000`, SMMU at `0x2ca0000`. The speed-bin fuse is at qfprom `0x784130` (bits 31:29).
 - Keys: PM8150 GPIO6 (volume up) and GPIO7 (volume down), power on PON KPDPWR. Alert slider on TLMM gpio27/134/125.
