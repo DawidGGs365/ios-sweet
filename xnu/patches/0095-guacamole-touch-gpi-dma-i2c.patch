@@ -1,0 +1,450 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 07:56:37.725587469 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 08:00:21.491105026 +0100
+@@ -16,6 +16,10 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <stdarg.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -160,11 +164,12 @@
+ 	hw.gpio_pa = GUAC_SOUTH_PA;
+ 	hw.gpio_size = (GUAC_IRQ + 1u) * 0x1000u;
+ 	hw.vote = 0x52014u;
+-	hw.vote_mask = (1u << 1) | (1u << 2) | (1u << 7);
+-	hw.rcg = 0x1e4d8u;
++	/* SE17 at 0xc80000 is wrapper 2 SE0 (DT clock 0x6d, GPI SE index 0): s0 clock, not s3 */
++	hw.vote_mask = (1u << 1) | (1u << 2) | (1u << 4);
++	hw.rcg = 0x1e148u;
+ 	hw.branch[0] = 0x1e004u;
+ 	hw.branch[1] = 0x1e008u;
+-	hw.branch[2] = 0x1e4d4u;
++	hw.branch[2] = 0x1e144u;
+ 	hw.nbranch = 3;
+ }
+ 
+@@ -336,11 +341,408 @@
+ 	return st.irq_last;
+ }
+ 
++/*
++ * guacamole: TrustZone loads SE17 (wrapper 2 SE0) with the I2C firmware but
++ * FIFO_IF_DISABLE set, so transfers must go through the QUP GPI DMA engine
++ * (DT qcom,gpi-dma@0xc00000, gpii-mask 0xfa, client cells <chan 0 3 64 0>:
++ * SE index 0, protocol 3 = I2C). Polled port of Linux gpi.c + the v6.1
++ * i2c-qcom-geni GPI path: one GPII, TX/RX channel rings, one event ring.
++ * GPI reaches memory as apps-SMMU stream 0x7b6; it needs S1 bypass there.
++ */
++#define GPI_PA                  0x00c00000u
++#define GPI_SIZE                0x00060000u
++#define GPI_GPII                1u
++#define GPI_CH_CNTXT(k)         (0x20000u + 0x4000u * GPI_GPII + 0x80u * (k))
++#define GPI_EV_CNTXT            (0x21000u + 0x4000u * GPI_GPII)
++#define GPI_CH_DB(k)            (0x22000u + 0x4000u * GPI_GPII + 0x8u * (k))
++#define GPI_EV_DB               (0x22100u + 0x4000u * GPI_GPII)
++#define GPI_CH_CMD              (0x23008u + 0x4000u * GPI_GPII)
++#define GPI_EV_CMD              (0x23010u + 0x4000u * GPI_GPII)
++#define GPI_GPII_REG(off)       ((off) + 0x4000u * GPI_GPII)
++#define GPI_CH_SCRATCH0(k)      (0x20060u + 0x4000u * GPI_GPII + 0x80u * (k))
++#define GPI_CH_QOS(k)           (0x2005cu + 0x4000u * GPI_GPII + 0x80u * (k))
++#define GPI_ERROR_LOG           GPI_GPII_REG(0x23200u)
++#define GPI_CMD_ALLOCATE        0u
++#define GPI_CMD_START           1u
++#define GPI_CMD_STOP            2u
++#define GPI_CMD_RESET           9u
++#define GPI_CMD_DEALLOC         10u
++#define GPI_STATE(v)            (((v) >> 20) & 0xfu)
++#define TRE_CONFIG0             (0x22u << 16)
++#define TRE_GO                  (0x20u << 16)
++#define TRE_DMA                 (0x10u << 16)
++#define TRE_CHAIN               (1u << 0)
++#define TRE_IEOT                (1u << 9)
++#define TRE_LINK                (1u << 11)
++#define GPI_I2C_WRITE           1u
++#define GPI_I2C_READ            2u
++/* one contiguous buffer: event ring 256 x 16 B, TX/RX rings 64 x 16 B, data */
++#define GB_EV                   0x0000u
++#define GB_EV_LEN               0x1000u
++#define GB_TX                   0x1000u
++#define GB_RX                   0x1400u
++#define GB_RING_LEN             0x0400u
++#define GB_TXBUF                0x2000u
++#define GB_RXBUF                0x2800u
++#define GB_SIZE                 0x4000u
++#define APPS_SMMU_PA            0x15000000u
++#define GPI_SID                 0x7b6u
++
++static struct {
++	bool on;
++	vm_offset_t regs, va;
++	uint64_t pa;
++	uint32_t ev_rp, tx_wp, rx_wp;           /* byte offsets inside their rings */
++	bool pend;                              /* pointer write waiting for its read */
++	uint8_t pend_addr, pend_n, pend_buf[3];
++	uint32_t last_ev[4];
++} gpi;
++
++static void
++gpi_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(gpi.pa + off), len, TRUE);
++}
++
++static bool
++gpi_cmd(uint32_t reg, uint32_t op, uint32_t chid, uint32_t state_reg, uint32_t want)
++{
++	touch_wr(gpi.regs, reg, (op << 24) | chid);
++	for (unsigned i = 0; i < 2500; i++) {          /* Linux CMD_TIMEOUT_MS 250 */
++		if (want == 0xffu || GPI_STATE(touch_rd(gpi.regs, state_reg)) == want) {
++			return true;
++		}
++		delay(100);
++	}
++	return false;
++}
++
++/*
++ * apps SMMU: the GPI stream must reach physical memory untranslated. Report
++ * what the boot firmware left for SID 0x7b6 and add a bypass stream match
++ * when unmatched streams would fault.
++ */
++static bool
++gpi_smmu_bypass(void)
++{
++	vm_offset_t smmu = ml_io_map(APPS_SMMU_PA, 0x1000);
++	if (!smmu) {
++		return false;
++	}
++	uint32_t scr0 = touch_rd(smmu, 0x0), idr0 = touch_rd(smmu, 0x20);
++	uint32_t nsmr = idr0 & 0xffu;
++	int match = -1, free_idx = -1;
++	for (uint32_t i = 0; i < nsmr && i < 128u; i++) {
++		uint32_t smr = touch_rd(smmu, 0x800 + 4 * i);
++		if (!(smr & (1u << 31))) {
++			if (free_idx < 0) {
++				free_idx = (int)i;
++			}
++			continue;
++		}
++		uint32_t mask = (smr >> 16) & 0x7fffu;
++		if (((smr ^ GPI_SID) & ~mask & 0x7fffu) == 0) {
++			match = (int)i;
++			break;
++		}
++	}
++	if (match >= 0) {
++		uint32_t s2cr = touch_rd(smmu, 0xc00 + 4 * (uint32_t)match);
++		uint32_t type = (s2cr >> 16) & 3u;
++		touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x smr%d %#x s2cr %#x (%s)\n", scr0, match,
++		    touch_rd(smmu, 0x800 + 4 * (uint32_t)match), s2cr,
++		    type == 1 ? "bypass" : type == 0 ? "translate" : "fault");
++		return type == 1;
++	}
++	if (!(scr0 & (1u << 10))) {
++		touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x: SID %#x unmatched, bypass\n", scr0, GPI_SID);
++		return true;
++	}
++	if ((scr0 & (1u << 3)) || free_idx < 0) {
++		touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x: SID %#x faults, no free SMR (%d)\n", scr0, GPI_SID, free_idx);
++		return false;
++	}
++	touch_wr(smmu, 0xc00 + 4 * (uint32_t)free_idx, 1u << 16);            /* S2CR: bypass */
++	touch_wr(smmu, 0x800 + 4 * (uint32_t)free_idx, (1u << 31) | GPI_SID);
++	touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x: added smr%d %#x s2cr %#x (bypass)\n", scr0, free_idx,
++	    touch_rd(smmu, 0x800 + 4 * (uint32_t)free_idx), touch_rd(smmu, 0xc00 + 4 * (uint32_t)free_idx));
++	return true;
++}
++
++/* Channel context: TX dir out (1), RX dir in (0), protocol GPI, event ring 0; ring rewinds. */
++static void
++gpi_ch_config(uint32_t k)
++{
++	uint64_t ring = gpi.pa + (k ? GB_RX : GB_TX);
++	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0x0, (16u << 24) | ((k ? 0u : 1u) << 3) | 2u);
++	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0x4, GB_RING_LEN);
++	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0x8, (uint32_t)ring);
++	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0xc, (uint32_t)(ring >> 32));
++	touch_wr(gpi.regs, GPI_CH_DB(k) + 4, (uint32_t)(ring >> 32));
++	touch_wr(gpi.regs, GPI_CH_SCRATCH0(k), ((k ? 0u : 1u) << 16) | (3u << 4) | 0u); /* pair, I2C, SE0 */
++	touch_wr(gpi.regs, GPI_CH_SCRATCH0(k) + 4, 0);
++	touch_wr(gpi.regs, GPI_CH_SCRATCH0(k) + 8, 0);
++	touch_wr(gpi.regs, GPI_CH_SCRATCH0(k) + 12, 0);
++	touch_wr(gpi.regs, GPI_CH_QOS(k), 1);
++	if (k) {
++		gpi.rx_wp = 0;
++	} else {
++		gpi.tx_wp = 0;
++	}
++}
++
++static bool
++gpi_ch_start(void)
++{
++	for (uint32_t k = 0; k < 2; k++) {
++		if (!gpi_cmd(GPI_CH_CMD, GPI_CMD_START, k, GPI_CH_CNTXT(k), 2u)) {
++			touch_log("SWEET TOUCH: GPI ch%u start timeout (%#x) err %#x\n", k,
++			    touch_rd(gpi.regs, GPI_CH_CNTXT(k)), touch_rd(gpi.regs, GPI_ERROR_LOG));
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Linux gpi_terminate_all: stop, reset, reprogram and restart both channels. */
++static bool
++gpi_restart(void)
++{
++	for (uint32_t k = 0; k < 2; k++) {
++		if (GPI_STATE(touch_rd(gpi.regs, GPI_CH_CNTXT(k))) == 2u) {
++			(void)gpi_cmd(GPI_CH_CMD, GPI_CMD_STOP, k, GPI_CH_CNTXT(k), 3u);
++		}
++		(void)gpi_cmd(GPI_CH_CMD, GPI_CMD_RESET, k, GPI_CH_CNTXT(k), 1u);
++		gpi_ch_config(k);
++	}
++	return gpi_ch_start();
++}
++
++static bool
++gpi_init(void)
++{
++	gpi.regs = ml_io_map(GPI_PA, GPI_SIZE);
++	if (!gpi.regs || kmem_alloc_contig(kernel_map, &gpi.va, GB_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		touch_log("SWEET TOUCH: GPI map/alloc failed\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)gpi.va);
++	if (!pn) {
++		return false;
++	}
++	gpi.pa = ptoa_64(pn);
++	if (!gpi_smmu_bypass()) {
++		return false;
++	}
++	uint32_t ev0 = touch_rd(gpi.regs, GPI_EV_CNTXT), tx0 = touch_rd(gpi.regs, GPI_CH_CNTXT(0)),
++	    rx0 = touch_rd(gpi.regs, GPI_CH_CNTXT(1));
++	touch_log("SWEET TOUCH: GPI gpii%u as found: ev %#x tx %#x rx %#x err %#x; buffers at 0x%llx\n",
++	    GPI_GPII, ev0, tx0, rx0, touch_rd(gpi.regs, GPI_ERROR_LOG), gpi.pa);
++	/* Release whatever a boot stage left on this GPII. */
++	for (uint32_t k = 0; k < 2; k++) {
++		uint32_t s = GPI_STATE(touch_rd(gpi.regs, GPI_CH_CNTXT(k)));
++		if (s == 2u) {
++			(void)gpi_cmd(GPI_CH_CMD, GPI_CMD_STOP, k, GPI_CH_CNTXT(k), 3u);
++		}
++		if (s != 0u) {
++			(void)gpi_cmd(GPI_CH_CMD, GPI_CMD_RESET, k, GPI_CH_CNTXT(k), 1u);
++			(void)gpi_cmd(GPI_CH_CMD, GPI_CMD_DEALLOC, k, 0, 0xffu);
++		}
++	}
++	if (GPI_STATE(ev0) != 0u) {
++		(void)gpi_cmd(GPI_EV_CMD, GPI_CMD_RESET, 0, GPI_EV_CNTXT, 1u);
++		(void)gpi_cmd(GPI_EV_CMD, GPI_CMD_DEALLOC, 0, 0, 0xffu);
++	}
++	/* Interrupts stay masked: completion is polled from the event ring. */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23088u), 0);         /* CNTXT_TYPE_IRQ_MSK */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23400u), 0);         /* SCRATCH_0/1 */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23404u), 0);
++	touch_wr(gpi.regs, GPI_ERROR_LOG, 0);
++
++	/* Event ring (gpi_alloc_ev_chan) */
++	uint64_t ev = gpi.pa + GB_EV;
++	if (!gpi_cmd(GPI_EV_CMD, GPI_CMD_ALLOCATE, 0, GPI_EV_CNTXT, 1u)) {
++		touch_log("SWEET TOUCH: GPI event ring allocate timeout (%#x)\n", touch_rd(gpi.regs, GPI_EV_CNTXT));
++		return false;
++	}
++	touch_wr(gpi.regs, GPI_EV_CNTXT + 0x0, (16u << 24) | (1u << 16) | 2u);
++	touch_wr(gpi.regs, GPI_EV_CNTXT + 0x4, GB_EV_LEN);
++	touch_wr(gpi.regs, GPI_EV_CNTXT + 0x8, (uint32_t)ev);
++	touch_wr(gpi.regs, GPI_EV_CNTXT + 0xc, (uint32_t)(ev >> 32));
++	touch_wr(gpi.regs, GPI_EV_DB + 4, (uint32_t)(ev >> 32));
++	for (uint32_t o = 0x20; o <= 0x34; o += 4) {
++		if (o != 0x24) {
++			touch_wr(gpi.regs, GPI_EV_CNTXT + o, 0);
++		}
++	}
++	gpi.ev_rp = 0;
++	gpi_sync(0, GB_SIZE);
++	touch_wr(gpi.regs, GPI_EV_DB, (uint32_t)(ev + GB_EV_LEN - 16u));
++
++	/* Channels (gpi_alloc_chan) */
++	for (uint32_t k = 0; k < 2; k++) {
++		if (!gpi_cmd(GPI_CH_CMD, GPI_CMD_ALLOCATE, k, GPI_CH_CNTXT(k), 1u)) {
++			touch_log("SWEET TOUCH: GPI ch%u allocate timeout (%#x)\n", k, touch_rd(gpi.regs, GPI_CH_CNTXT(k)));
++			return false;
++		}
++		gpi_ch_config(k);
++	}
++	if (!gpi_ch_start()) {
++		return false;
++	}
++	/* SE side: geni_se_select_gpi_mode */
++	touch_wr(st.se, 0xe18, 0);                     /* SE_GSI_EVENT_EN */
++	touch_wr(st.se, 0x618, 0xffffffffu);           /* M_IRQ_CLEAR */
++	touch_wr(st.se, 0x648, 0xffffffffu);           /* S_IRQ_CLEAR */
++	touch_wr(st.se, 0xc44, 0xffffffffu);           /* DMA_TX_IRQ_CLR */
++	touch_wr(st.se, 0xd44, 0xffffffffu);           /* DMA_RX_IRQ_CLR */
++	touch_wr(st.se, 0xe1c, 0);                     /* SE_IRQ_EN */
++	touch_wr(st.se, 0x614, touch_rd(st.se, 0x614) & ~((1u << 0) | (1u << 26) | (1u << 27) | (1u << 30)));
++	touch_wr(st.se, 0x258, 1);                     /* SE_GENI_DMA_MODE_EN */
++	touch_wr(st.se, 0xe18, 0xfu);                  /* DMA RX/TX, M, S events to GSI */
++	touch_wr(st.se, SE_CLK_SEL, touch_dfs_level);
++	touch_log("SWEET TOUCH: GPI gpii%u ready: ev %#x tx %#x rx %#x\n", GPI_GPII,
++	    touch_rd(gpi.regs, GPI_EV_CNTXT), touch_rd(gpi.regs, GPI_CH_CNTXT(0)), touch_rd(gpi.regs, GPI_CH_CNTXT(1)));
++	gpi.on = true;
++	return true;
++}
++
++static void
++gpi_queue(uint32_t k, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3)
++{
++	uint32_t *wp = k ? &gpi.rx_wp : &gpi.tx_wp;
++	uint32_t base = k ? GB_RX : GB_TX;
++	uint32_t *tre = (uint32_t *)(gpi.va + base + *wp);
++	tre[0] = d0;
++	tre[1] = d1;
++	tre[2] = d2;
++	tre[3] = d3;
++	gpi_sync(base + *wp, 16);
++	*wp = (*wp + 16u) % GB_RING_LEN;
++}
++
++static void
++gpi_ring(uint32_t k)
++{
++	uint32_t base = k ? GB_RX : GB_TX;
++	touch_wr(gpi.regs, GPI_CH_DB(k), (uint32_t)(gpi.pa + base + (k ? gpi.rx_wp : gpi.tx_wp)));
++}
++
++/* Wait for the transfer-complete event of channel k; 0, EIO on error code, ETIMEDOUT. */
++static int
++gpi_wait(uint32_t k)
++{
++	for (unsigned i = 0; i < 1000; i++) {           /* 100 ms */
++		uint32_t hwrp = touch_rd(gpi.regs, GPI_EV_CNTXT + 0x10) - (uint32_t)(gpi.pa + GB_EV);
++		while (hwrp < GB_EV_LEN && gpi.ev_rp != hwrp) {
++			gpi_sync(GB_EV + gpi.ev_rp, 16);
++			const uint32_t *ev = (const uint32_t *)(gpi.va + GB_EV + gpi.ev_rp);
++			memcpy(gpi.last_ev, ev, sizeof(gpi.last_ev));
++			gpi.ev_rp = (gpi.ev_rp + 16u) % GB_EV_LEN;
++			/* recycle: the write pointer trails the read pointer by one element */
++			touch_wr(gpi.regs, GPI_EV_DB, (uint32_t)(gpi.pa + GB_EV + (gpi.ev_rp + GB_EV_LEN - 16u) % GB_EV_LEN));
++			uint32_t type = (gpi.last_ev[3] >> 16) & 0xffu, chid = gpi.last_ev[3] >> 24;
++			uint32_t code = gpi.last_ev[2] >> 24;
++			if ((type == 0x22u || type == 0x30u) && chid == k) {
++				return code == 16u ? EIO : 0;
++			}
++		}
++		delay(100);
++	}
++	return ETIMEDOUT;
++}
++
++/* 400 kHz from 19.2 MHz (Linux geni_i2c_clk_map): div 2, high 5, low 12, cycle 24, TX/RX packing. */
++#define GPI_I2C_CONFIG0         (12u | (5u << 8) | (24u << 16) | (1u << 24) | (1u << 25))
++
++static int
++gpi_write_phase(uint8_t addr, const uint8_t *tx, unsigned nt, bool stretch)
++{
++	memcpy((void *)(gpi.va + GB_TXBUF), tx, nt);
++	gpi_sync(GB_TXBUF, 64);
++	gpi_queue(0, GPI_I2C_CONFIG0, 0, 2u, TRE_CONFIG0 | TRE_CHAIN);
++	gpi_queue(0, GPI_I2C_WRITE | ((uint32_t)addr << 8) | (stretch ? (1u << 26) : 0u), 0, nt,
++	    TRE_GO | TRE_CHAIN);
++	gpi_queue(0, (uint32_t)(gpi.pa + GB_TXBUF), (uint32_t)((gpi.pa + GB_TXBUF) >> 32), nt, TRE_DMA | TRE_IEOT);
++	gpi_ring(0);
++	return gpi_wait(0);
++}
++
++static int
++gpi_read_phase(uint8_t addr, uint8_t *rx, unsigned nr)
++{
++	gpi_sync(GB_RXBUF, (nr + 63u) & ~63u);
++	gpi_queue(1, (uint32_t)(gpi.pa + GB_RXBUF), (uint32_t)((gpi.pa + GB_RXBUF) >> 32), nr, TRE_DMA | TRE_IEOT);
++	gpi_queue(0, GPI_I2C_READ | ((uint32_t)addr << 8), 0, nr, TRE_GO | TRE_LINK);
++	gpi_ring(1);
++	gpi_ring(0);
++	int err = gpi_wait(1);
++	if (!err) {
++		gpi_sync(GB_RXBUF, (nr + 63u) & ~63u);
++		memcpy(rx, (const void *)(gpi.va + GB_RXBUF), nr);
++	}
++	return err;
++}
++
++/*
++ * touch_msg() split a register read into a stretched pointer write and a
++ * read; GPI needs them as one sequence, so the write is held until the read.
++ */
++static int
++gpi_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	if (nt && !nr && stretch) {
++		if (nt > sizeof(gpi.pend_buf)) {
++			return EIO;
++		}
++		gpi.pend = true;
++		gpi.pend_addr = addr;
++		gpi.pend_n = (uint8_t)nt;
++		memcpy(gpi.pend_buf, tx, nt);
++		return 0;
++	}
++	int err;
++	if (nr) {
++		if (nr > 0x800u) {
++			return EIO;
++		}
++		if (gpi.pend && gpi.pend_addr == addr) {
++			gpi.pend = false;
++			err = gpi_write_phase(addr, gpi.pend_buf, gpi.pend_n, true);
++			if (!err) {
++				err = gpi_read_phase(addr, rx, nr);
++			}
++		} else {
++			gpi.pend = false;
++			err = EIO;      /* bare reads are not used by these touch ICs */
++		}
++	} else {
++		gpi.pend = false;
++		err = gpi_write_phase(addr, tx, nt, false);
++	}
++	if (err) {
++		if (st.probing) {
++			touch_log("SWEET TOUCH: GPI xfer addr=%#x err=%d ev %08x %08x %08x %08x err-log %#x ch %#x/%#x\n",
++			    addr, err, gpi.last_ev[0], gpi.last_ev[1], gpi.last_ev[2], gpi.last_ev[3],
++			    touch_rd(gpi.regs, GPI_ERROR_LOG), touch_rd(gpi.regs, GPI_CH_CNTXT(0)),
++			    touch_rd(gpi.regs, GPI_CH_CNTXT(1)));
++		}
++		if (!gpi_restart()) {
++			st.dead = true;
++		}
++	}
++	return err;
++}
++
+ /* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
+ static int
+ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
++	if (gpi.on && !st.dead && ((nt != 0) != (nr != 0))) {
++		return gpi_msg(addr, tx, nt, rx, nr, stretch);
++	}
+ 	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+ 	}
+@@ -630,6 +1032,10 @@
+ 	 * since the register layout differs between QUP versions.
+ 	 */
+ 	const uint32_t ifdis = touch_rd(st.se, 0x64);
++	if (hw.guac && ((fw >> 8) & 0xffu) == 3u && (ifdis & 1u)) {
++		touch_log("SWEET TOUCH: SE17 FIFO interface disabled (fw=%#x ifdis=%#x): using GPI DMA\n", fw, ifdis);
++		return gpi_init();
++	}
+ 	const bool fifo_ok = ((tx >> 24) & 0x3fu) == 32u && ((rx >> 24) & 0x3fu) == 32u &&
+ 	    ((tx >> 16) & 0x3fu) >= 2u && ((rx >> 16) & 0x3fu) >= 2u;
+ 	if (((fw >> 8) & 0xffu) != 3u || (ifdis & 1u) || (!fifo_ok && !hw.guac)) {
