@@ -1,0 +1,364 @@
+diff --color -ruN a/bsd/dev/sweet_dsi.c b/bsd/dev/sweet_dsi.c
+--- a/bsd/dev/sweet_dsi.c	2026-11-06 13:30:28.139821037 +0100
++++ b/bsd/dev/sweet_dsi.c	2026-11-06 13:30:28.140498354 +0100
+@@ -9,8 +9,9 @@
+  * 1..0x3ff normal range (qcom,mdss-dsi-bl-normal-max-level). HBM levels
+  * above 0x3ff are refused here.
+  *
+- * boot-arg sweetbl=N (1..1023): set brightness N once, 60 s after boot,
+- * to verify the path without the GUI. sweetdsi=0 disables all DSI writes.
++ * boot-arg sweetbl=N (1..1023): set brightness N once, sweetbldelay seconds
++ * (default 60) after boot, to verify the path without the GUI.
++ * sweetdsi=0 disables all DSI writes.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -190,8 +191,10 @@
+ {
+ 	(void)result;
+ 	unsigned level = (unsigned)(uintptr_t)arg;
++	unsigned delay_s = 60;
++	(void)PE_parse_boot_argn("sweetbldelay", &delay_s, sizeof(delay_s));
+ 	uint64_t deadline;
+-	clock_interval_to_deadline(60, NSEC_PER_SEC, &deadline);
++	clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
+ 	(void)assert_wait_deadline(&d_sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ 	(void)sweet_dsi_set_brightness(level);
+diff --color -ruN a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c	2026-11-06 13:30:28.139789558 +0100
++++ b/bsd/dev/sweet_gpu.c	2026-11-06 13:30:28.140468953 +0100
+@@ -238,20 +238,26 @@
+ #define GVA_DCACHE              0x00044000u
+ #define GVA_CACHE_SIZE          0x0003c000u     /* SZ_256K - SZ_16K */
+ #define GVA_DUMMY               0x60000000u
+-#define GVA_HFI                 0x60001000u
+-#define GVA_LOG                 0x60005000u
+-#define GVA_BUF_SIZE            0x4000u
++/*
++ * KGSL allocate_gmu_kmem(GMU_NONCACHED_KERNEL): one 1 MiB slot per buffer
++ * from 0x60000000, in probe order: WB dummy page, HFI, (a630 dump), log.
++ */
++#define GVA_HFI                 0x60100000u
++#define GVA_LOG                 0x60200000u
++#define GVA_HFI_SIZE            0x5000u         /* PAGE_ALIGN(HFIMEM_SIZE): 0xe8 + 16 + 4 x 4 KiB */
++#define GVA_LOG_SIZE            0x1000u         /* LOGMEM_SIZE */
+ /* offsets in the one contiguous allocation */
+ #define GM_L1                   0x00000u
+ #define GM_L2A                  0x01000u
+ #define GM_L3A                  0x02000u
+ #define GM_L2B                  0x03000u
+-#define GM_L3B                  0x04000u
++#define GM_L3B                  0x04000u        /* 0x60000000-0x601fffff */
++#define GM_L3C                  0x05000u        /* 0x60200000-0x603fffff */
+ #define GM_ICACHE               0x10000u
+ #define GM_DCACHE               0x50000u
+ #define GM_DUMMY                0x90000u
+ #define GM_HFI                  0x91000u
+-#define GM_LOG                  0x95000u
++#define GM_LOG                  0x97000u
+ #define GM_SIZE                 0x100000u
+ 
+ static vm_offset_t gm_va;
+@@ -278,7 +284,7 @@
+ static void
+ gm_map(uint32_t gva, uint32_t off, uint32_t size, bool unpriv)
+ {
+-	uint64_t *l3 = (uint64_t *)(gm_va + (gva < 0x40000000u ? GM_L3A : GM_L3B));
++	uint64_t *l3 = (uint64_t *)(gm_va + (gva < 0x40000000u ? GM_L3A : gva < 0x60200000u ? GM_L3B : GM_L3C));
+ 	for (uint32_t o = 0; o < size; o += 0x1000u) {
+ 		l3[((gva + o) >> 12) & 0x1ffu] = (gm_pa + off + o) | 3u | (1u << 10) | (3u << 8) |
+ 		    (unpriv ? (1u << 6) : 0u) | (1u << 11);
+@@ -303,37 +309,50 @@
+ 	l1[GVA_DUMMY >> 30] = (gm_pa + GM_L2B) | 3u;            /* 0x40000000-0x7fffffff */
+ 	l2a[0] = (gm_pa + GM_L3A) | 3u;
+ 	l2b[(GVA_DUMMY >> 21) & 0x1ffu] = (gm_pa + GM_L3B) | 3u;
++	l2b[(GVA_LOG >> 21) & 0x1ffu] = (gm_pa + GM_L3C) | 3u;
+ 	gm_map(GVA_ICACHE, GM_ICACHE, GVA_CACHE_SIZE, false);
+ 	gm_map(GVA_DCACHE, GM_DCACHE, GVA_CACHE_SIZE, false);
+ 	gm_map(GVA_DUMMY, GM_DUMMY, 0x1000u, false);
+-	gm_map(GVA_HFI, GM_HFI, GVA_BUF_SIZE, true);
+-	gm_map(GVA_LOG, GM_LOG, GVA_BUF_SIZE, false);
++	gm_map(GVA_HFI, GM_HFI, GVA_HFI_SIZE, true);
++	gm_map(GVA_LOG, GM_LOG, GVA_LOG_SIZE, false);
+ 	return true;
+ }
+ 
+ /*
+- * HFI queue table (Linux a6xx_hfi_init): 6-word table header, two 12-word
+- * queue headers, command queue (id 0) and response queue (id 4), 4 KiB each.
++ * HFI queue table, KGSL S_12.1 hfi_init(): 6-dword table header, 4 queue
++ * headers of 12 dwords (cmd, msg, dbg enabled; dispatch 0 disabled), the
++ * queues at ALIGN(sizeof(table), 16) + i * 4 KiB. a640 firmware uses the
++ * non-legacy queue ids 0/1/2/3 (legacy 0/4/5/1 is a630/a615 only); s0102
++ * with a 2-queue legacy table faulted at 0xdeadbee0 and reported 0xbaddface.
+  */
+ static void
+ gm_hfi_table(void)
+ {
++	static const struct { uint32_t id, pri, status; } q[4] = {
++		{ 0, 10, 1 }, { 1, 10, 1 }, { 2, 40, 1 }, { 3, 20, 0 },
++	};
++	const uint32_t qoff = (6u * 4u + 4u * 12u * 4u + 15u) & ~15u;  /* 0xe0 */
+ 	uint32_t *t = (uint32_t *)(gm_va + GM_HFI);
+ 	t[0] = 0;                       /* version */
+-	t[1] = (6 + 2 * 12);            /* size, dwords */
++	t[1] = 6 + 4 * 12;              /* size, dwords */
+ 	t[2] = 6;                       /* qhdr0 offset, dwords */
+ 	t[3] = 12;                      /* qhdr size, dwords */
+-	t[4] = 2;                       /* num queues */
+-	t[5] = 2;                       /* active queues */
+-	for (unsigned q = 0; q < 2; q++) {
+-		uint32_t *h = t + 6 + 12 * q;
+-		h[0] = 1;                                       /* status: enabled */
+-		h[1] = GVA_HFI + 0x1000u * (q + 1);             /* queue iova */
+-		h[2] = (10u << 8) | (q ? 4u : 0u);              /* type: priority 10, id */
+-		h[3] = 0x1000u >> 2;                            /* size, dwords */
+-		h[6] = 1;                                       /* rx watermark */
+-		h[7] = 1;                                       /* tx watermark */
+-		h[8] = 1;                                       /* rx request */
++	t[4] = 4;                       /* num queues */
++	t[5] = 4;                       /* active queues (KGSL counts all) */
++	for (unsigned i = 0; i < 4; i++) {
++		uint32_t *h = t + 6 + 12 * i;
++		h[0] = q[i].status;
++		h[1] = GVA_HFI + qoff + 0x1000u * i;            /* start_addr */
++		h[2] = q[i].id | (q[i].pri << 8);               /* QUEUE_HDR_TYPE(id, pri, 0, 0) */
++		h[3] = 0x1000u >> 2;                            /* queue_size, dwords */
++		h[4] = 0;                                       /* msg_size */
++		h[5] = 0;                                       /* drop_cnt */
++		h[6] = 1;                                       /* rx_wm */
++		h[7] = 1;                                       /* tx_wm */
++		h[8] = 1;                                       /* rx_req */
++		h[9] = 0;                                       /* tx_req */
++		h[10] = 0;                                      /* read_index */
++		h[11] = 0;                                      /* write_index */
+ 	}
+ }
+ 
+@@ -393,7 +412,7 @@
+ 	uint32_t n = (uint32_t)gm_smmu_cb;
+ 
+ 	/* Stage-1 tables are walked from memory: clean them to the point of coherency first. */
+-	flush_dcache64((addr64_t)gm_pa, 0x5000u, TRUE);
++	flush_dcache64((addr64_t)gm_pa, 0x6000u, TRUE);
+ 
+ 	gpu_wr(gm_cb, 0x0, 0);                                         /* SCTLR off while programming */
+ 	gpu_wr(gr1, 4 * n, (1u << 16) | (3u << 8) | (0xfu << 12));     /* CBAR: S1 trans/S2 bypass, BPSHCFG NSH, WB */
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 13:30:28.139767795 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 13:30:28.140449471 +0100
+@@ -388,11 +388,16 @@
+ #define GB_SIZE                 0x4000u
+ #define APPS_SMMU_PA            0x15000000u
+ #define GPI_SID                 0x7b6u
++#define GPI_IOVA                0x00100000u     /* DT gpi_dma2 qcom,iova-range start */
+ 
+ static struct {
+ 	bool on;
+ 	vm_offset_t regs, va;
+ 	uint64_t pa;
++	uint64_t dva;                           /* device (IOVA) address of the buffer */
++	vm_offset_t pt_va;                      /* stage-1 tables: L1, L2, L3 */
++	vm_offset_t cb;                         /* apps-SMMU context bank registers */
++	uint64_t pt_pa;
+ 	uint32_t ev_rp, tx_wp, rx_wp;           /* byte offsets inside their rings */
+ 	bool pend;                              /* pointer write waiting for its read */
+ 	uint8_t pend_addr, pend_n, pend_buf[3];
+@@ -502,24 +507,57 @@
+ 		}
+ 	} else if (!(scr0 & (1u << 10))) {
+ 		touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x: SID %#x unmatched and USFCFG=0 (bypass)\n", scr0, GPI_SID);
++		gpi.dva = gpi.pa;
+ 		return true;
+ 	} else if (free_idx < 0) {
+ 		touch_log("SWEET TOUCH: GPI apps-SMMU no free SMR; no DMA\n");
+ 		return false;
+ 	}
+ 	const uint32_t idx = (uint32_t)(match >= 0 ? match : free_idx);
+-	touch_wr(cbr, 0x0, 0);                                  /* SCTLR: M=0, no stage-1 translation */
+-	touch_wr(gr1, 4 * cb, 1u << 16);                        /* CBAR: S1 translate, S2 bypass */
++	/*
++	 * 0105: real stage-1 translation like Linux (DT gpi_dma2 smmu-cfg = 1,
++	 * iova-range 0x100000): s0102's QSB log showed the GPI's first TRE read
++	 * (0x1_831fd01c) failing on the bus with this context bank in bypass
++	 * (SCTLR.M = 0). IOVA GPI_IOVA + o -> gpi.pa + o for the 16 KiB buffer.
++	 * 4 KiB pages, AF, inner shareable, AP[1] unprivileged RW (device
++	 * transactions), MAIR index 0 = normal non-cacheable; the CPU side is
++	 * kept coherent with explicit cache maintenance (gpi_sync).
++	 */
++	uint64_t *l1 = (uint64_t *)gpi.pt_va, *l2 = (uint64_t *)(gpi.pt_va + 0x1000), *l3 = (uint64_t *)(gpi.pt_va + 0x2000);
++	l1[0] = (gpi.pt_pa + 0x1000) | 3u;
++	l2[0] = (gpi.pt_pa + 0x2000) | 3u;
++	for (uint32_t o = 0; o < GB_SIZE; o += 0x1000u) {
++		l3[((GPI_IOVA + o) >> 12) & 0x1ffu] = (gpi.pa + o) | 3u | (1u << 10) | (3u << 8) | (1u << 6) | (1u << 11);
++	}
++	flush_dcache64((addr64_t)gpi.pt_pa, 0x3000u, TRUE);
++	touch_wr(cbr, 0x0, 0);                                  /* SCTLR off while programming */
++	touch_wr(gr1, 4 * cb, (1u << 16) | (3u << 8) | (0xfu << 12)); /* CBAR: S1 trans/S2 bypass */
++	touch_wr(gr1, 0x800 + 4 * cb, 1u);                      /* CBA2R: AArch64 */
++	touch_wr(cbr, 0x10, 2u | (1u << 4));                    /* TCR2: 40-bit PA */
++	touch_wr(cbr, 0x20, (uint32_t)gpi.pt_pa);               /* TTBR0 */
++	touch_wr(cbr, 0x24, (uint32_t)(gpi.pt_pa >> 32) | (0x55u << 16));
++	touch_wr(cbr, 0x28, 0);
++	touch_wr(cbr, 0x2c, 0);
++	touch_wr(cbr, 0x30, 32u | (1u << 23));                  /* TCR: T0SZ 32, 4K, NC walks, EPD1 */
++	touch_wr(cbr, 0x38, 0x0004ff44u);                       /* MAIR0: 0 NC, 1 WB, 2 device */
++	touch_wr(cbr, 0x3c, 0);
++	touch_wr(cbr, 0x58, touch_rd(cbr, 0x58));               /* clear FSR */
++	touch_wr(cbr, 0x618, 0);                                /* TLBIALL */
++	touch_wr(cbr, 0x7f0, 0);                                /* TLBSYNC */
++	(void)touch_wait_clear(cbr, 0x7f4, 1u);
++	touch_wr(cbr, 0x0, 1u | (1u << 1) | (1u << 2) | (1u << 5) | (1u << 6)); /* M TRE AFE CFRE CFIE */
+ 	touch_wr(smmu, 0xc00 + 4 * idx, cb);                    /* S2CR: translate via cb */
+ 	touch_wr(smmu, 0x800 + 4 * idx, (1u << 31) | GPI_SID);  /* SMR: exact SID */
+ 	uint32_t s2cr = touch_rd(smmu, 0xc00 + 4 * idx), smr = touch_rd(smmu, 0x800 + 4 * idx);
+ 	uint32_t cbar = touch_rd(gr1, 4 * cb), sctlr = touch_rd(cbr, 0x0);
+ 	bool ok = ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == cb && smr == ((1u << 31) | GPI_SID) &&
+-	    ((cbar >> 16) & 3u) == 1u && !(sctlr & 1u);
+-	touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x smr%u %#x s2cr %#x -> cb%u cbar %#x sctlr %#x: %s\n",
+-	    scr0, idx, smr, s2cr, cb, cbar, sctlr, ok ? "bypass via cb" : "REJECTED, no DMA");
++	    ((cbar >> 16) & 3u) == 1u && (sctlr & 1u) && touch_rd(cbr, 0x20) == (uint32_t)gpi.pt_pa;
++	gpi.cb = cbr;
++	touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x smr%u %#x s2cr %#x -> cb%u cbar %#x sctlr %#x ttbr 0x%llx iova %#x: %s\n",
++	    scr0, idx, smr, s2cr, cb, cbar, sctlr, gpi.pt_pa, GPI_IOVA, ok ? "S1 translation" : "REJECTED, no DMA");
+ 	if (!ok) {
+ 		touch_wr(smmu, 0x800 + 4 * idx, 0);             /* drop the stream entry again */
++		gpi.cb = 0;
+ 	}
+ 	return ok;
+ }
+@@ -528,7 +566,7 @@
+ static void
+ gpi_ch_config(uint32_t k)
+ {
+-	uint64_t ring = gpi.pa + (k ? GB_RX : GB_TX);
++	uint64_t ring = gpi.dva + (k ? GB_RX : GB_TX);
+ 	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0x0, (16u << 24) | ((gpi.erindex & 0x1fu) << 14) | ((k ? 0u : 1u) << 3) | 2u);
+ 	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0x4, GB_RING_LEN);
+ 	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0x8, (uint32_t)ring);
+@@ -598,6 +636,14 @@
+ 		return false;
+ 	}
+ 	gpi.pa = ptoa_64(pn);
++	gpi.dva = GPI_IOVA;
++	if (kmem_alloc_contig(kernel_map, &gpi.pt_va, 0x4000, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    !(pn = pmap_find_phys(kernel_pmap, (addr64_t)gpi.pt_va))) {
++		touch_log("SWEET TOUCH: GPI page table alloc failed\n");
++		return false;
++	}
++	gpi.pt_pa = ptoa_64(pn);
+ 	/*
+ 	 * 0099: Linux geni-se votes the QUP2 -> DDR bus path before every GSI
+ 	 * transfer (DT qupv3_2 bus-mas-id 0x99, bus-slv-id 0x200). On SM8150
+@@ -665,7 +711,7 @@
+ 	    touch_rd(gpi.regs, GPI_GPII_REG(0x2309cu)));
+ 
+ 	/* Event ring (gpi_alloc_ev_chan) */
+-	uint64_t ev = gpi.pa + GB_EV;
++	uint64_t ev = gpi.dva + GB_EV;
+ 	if (!gpi_cmd(GPI_EV_CMD, GPI_CMD_ALLOCATE, 0, GPI_EV_CNTXT, 1u)) {
+ 		touch_log("SWEET TOUCH: GPI event ring allocate timeout (%#x)\n", touch_rd(gpi.regs, GPI_EV_CNTXT));
+ 		return false;
+@@ -738,7 +784,7 @@
+ gpi_ring(uint32_t k)
+ {
+ 	uint32_t base = k ? GB_RX : GB_TX;
+-	touch_wr(gpi.regs, GPI_CH_DB(k), (uint32_t)(gpi.pa + base + (k ? gpi.rx_wp : gpi.tx_wp)));
++	touch_wr(gpi.regs, GPI_CH_DB(k), (uint32_t)(gpi.dva + base + (k ? gpi.rx_wp : gpi.tx_wp)));
+ }
+ 
+ /* Wait for the transfer-complete event of channel k; 0, EIO on error code, ETIMEDOUT. */
+@@ -746,14 +792,14 @@
+ gpi_wait(uint32_t k)
+ {
+ 	for (unsigned i = 0; i < 1000; i++) {           /* 100 ms */
+-		uint32_t hwrp = touch_rd(gpi.regs, GPI_EV_CNTXT + 0x10) - (uint32_t)(gpi.pa + GB_EV);
++		uint32_t hwrp = touch_rd(gpi.regs, GPI_EV_CNTXT + 0x10) - (uint32_t)(gpi.dva + GB_EV);
+ 		while (hwrp < GB_EV_LEN && gpi.ev_rp != hwrp) {
+ 			gpi_sync(GB_EV + gpi.ev_rp, 16);
+ 			const uint32_t *ev = (const uint32_t *)(gpi.va + GB_EV + gpi.ev_rp);
+ 			memcpy(gpi.last_ev, ev, sizeof(gpi.last_ev));
+ 			gpi.ev_rp = (gpi.ev_rp + 16u) % GB_EV_LEN;
+ 			/* recycle: the write pointer trails the read pointer by one element */
+-			touch_wr(gpi.regs, GPI_EV_DB, (uint32_t)(gpi.pa + GB_EV + (gpi.ev_rp + GB_EV_LEN - 16u) % GB_EV_LEN));
++			touch_wr(gpi.regs, GPI_EV_DB, (uint32_t)(gpi.dva + GB_EV + (gpi.ev_rp + GB_EV_LEN - 16u) % GB_EV_LEN));
+ 			uint32_t type = (gpi.last_ev[3] >> 16) & 0xffu, chid = gpi.last_ev[3] >> 24;
+ 			uint32_t code = gpi.last_ev[2] >> 24;
+ 			if ((type == 0x22u || type == 0x30u) && chid == k) {
+@@ -776,7 +822,7 @@
+ 	gpi_queue(0, GPI_I2C_CONFIG0, 0, 2u, TRE_CONFIG0 | TRE_CHAIN);
+ 	gpi_queue(0, GPI_I2C_WRITE | ((uint32_t)addr << 8) | (stretch ? (1u << 26) : 0u), 0, 0,
+ 	    TRE_GO | TRE_CHAIN);    /* downstream i2c-qcom-geni: write GO rx_len 0 */
+-	gpi_queue(0, (uint32_t)(gpi.pa + GB_TXBUF), (uint32_t)((gpi.pa + GB_TXBUF) >> 32), nt, TRE_DMA | TRE_IEOT);
++	gpi_queue(0, (uint32_t)(gpi.dva + GB_TXBUF), (uint32_t)((gpi.dva + GB_TXBUF) >> 32), nt, TRE_DMA | TRE_IEOT);
+ 	gpi_chk("before-tx-db");
+ 	gpi_ring(0);
+ 	delay(200);
+@@ -788,7 +834,7 @@
+ gpi_read_phase(uint8_t addr, uint8_t *rx, unsigned nr)
+ {
+ 	gpi_sync(GB_RXBUF, (nr + 63u) & ~63u);
+-	gpi_queue(1, (uint32_t)(gpi.pa + GB_RXBUF), (uint32_t)((gpi.pa + GB_RXBUF) >> 32), nr, TRE_DMA | TRE_IEOT);
++	gpi_queue(1, (uint32_t)(gpi.dva + GB_RXBUF), (uint32_t)((gpi.dva + GB_RXBUF) >> 32), nr, TRE_DMA | TRE_IEOT);
+ 	gpi_queue(0, GPI_I2C_READ | ((uint32_t)addr << 8), 0, nr, TRE_GO | TRE_LINK | (1u << 8)); /* + IEOB */
+ 	gpi_ring(1);
+ 	gpi_ring(0);
+@@ -838,7 +884,7 @@
+ 	}
+ 	if (err) {
+ 		if (st.probing) {
+-			uint32_t ring = (uint32_t)(gpi.pa + GB_TX);
++			uint32_t ring = (uint32_t)(gpi.dva + GB_TX);
+ 			touch_log("SWEET TOUCH: GPI xfer addr=%#x err=%d ev %08x %08x %08x %08x err-log %#x ch %#x/%#x "
+ 			    "tx-rp +%#x irq type %#x glob %#x gpii %#x ch %#x ev-rp +%#x\n",
+ 			    addr, err, gpi.last_ev[0], gpi.last_ev[1], gpi.last_ev[2], gpi.last_ev[3],
+@@ -846,7 +892,7 @@
+ 			    touch_rd(gpi.regs, GPI_CH_CNTXT(1)), touch_rd(gpi.regs, GPI_CH_CNTXT(0) + 0x10) - ring,
+ 			    touch_rd(gpi.regs, GPI_GPII_REG(0x23080u)), touch_rd(gpi.regs, GPI_GPII_REG(0x23100u)),
+ 			    touch_rd(gpi.regs, GPI_GPII_REG(0x23118u)), touch_rd(gpi.regs, GPI_GPII_REG(0x23090u)),
+-			    touch_rd(gpi.regs, GPI_EV_CNTXT + 0x10) - (uint32_t)(gpi.pa + GB_EV));
++			    touch_rd(gpi.regs, GPI_EV_CNTXT + 0x10) - (uint32_t)(gpi.dva + GB_EV));
+ 			if (gpi.chk_logs < 24) {
+ 				gpi.chk_logs += 4;
+ 				uint32_t c[8], e[8], t[12];
+@@ -871,6 +917,11 @@
+ 				    touch_rd(gpi.regs, 0x5050), touch_rd(gpi.regs, 0x5060), touch_rd(gpi.regs, 0x5064), touch_rd(gpi.regs, 0x5068),
+ 				    touch_rd(gpi.regs, 0x506c), touch_rd(gpi.regs, 0x5070), touch_rd(gpi.regs, 0x5074),
+ 				    touch_rd(gpi.regs, 0x5078), touch_rd(gpi.regs, 0x507c));
++				if (gpi.cb) {
++					touch_log("SWEET TOUCH: GPI smmu cb FSR %#x FAR 0x%08x%08x FSYNR0 %#x\n",
++					    touch_rd(gpi.cb, 0x58), touch_rd(gpi.cb, 0x64), touch_rd(gpi.cb, 0x60),
++					    touch_rd(gpi.cb, 0x68));
++				}
+ 				touch_log("SWEET TOUCH: GPI tx TREs @+%#x %x %x %x %x | %x %x %x %x | %x %x %x %x\n", o,
+ 				    t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11]);
+ 			}
+diff --color -ruN a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c	2026-11-06 13:30:28.139804446 +0100
++++ b/bsd/dev/sweet_usb.c	2026-11-06 13:30:28.140482668 +0100
+@@ -403,7 +403,13 @@
+ 		return;
+ 	}
+ 	usb_soc_select();
+-	if (usb_guac && enabled >= 2) {
++	/*
++	 * The 5 s recap was for reading the log from screen photos; with the
++	 * live USB log it only repeats lines. sweetusbrecap=1 brings it back.
++	 */
++	int recap_on = 0;
++	(void)PE_parse_boot_argn("sweetusbrecap", &recap_on, sizeof(recap_on));
++	if (usb_guac && enabled >= 2 && recap_on) {
+ 		thread_t recap;
+ 		if (kernel_thread_start(usb_recap_thread, NULL, &recap) == KERN_SUCCESS) {
+ 			thread_deallocate(recap);
+@@ -1118,7 +1124,7 @@
+ 			for (uint32_t done = 0; done < count; done += 4) {
+ 				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+ 				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
+-				if (ud.events++ < 200) {
++				if (ud.events++ < 40) {
+ 					printf("SWEET USB: event 0x%08x\n", ev);
+ 				}
+ 				ud_event(ev);
