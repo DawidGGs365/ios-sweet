@@ -1,0 +1,115 @@
+diff --color -ruN a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c	2026-11-06 13:35:39.147858988 +0100
++++ b/bsd/dev/sweet_gpu.c	2026-11-06 13:35:39.148570656 +0100
+@@ -356,6 +356,84 @@
+ 	}
+ }
+ 
++/*
++ * HFI v2 transport (KGSL S_12.1 hfi_queue_write / hfi_send_cmd /
++ * hfi_queue_read). The GMU maps HFI non-cacheable; the CPU side goes
++ * through the cache, so every exchange cleans/invalidates the HFI pages.
++ */
++#define HFI_QOFF                0xe0u           /* ALIGN(sizeof(hfi_queue_table), 16) */
++#define GMU_HFI_VERSION_INFO    (0x5181u << 2)
++#define GMU_GMU2HOST_INTR_CLR   (0x5191u << 2)
++#define GMU_GMU2HOST_INTR_INFO  (0x5192u << 2)
++#define GMU_HOST2GMU_INTR_SET   (0x5194u << 2)
++static uint32_t gm_hfi_seq;
++
++static uint32_t *
++gm_qhdr(unsigned q)
++{
++	return (uint32_t *)(gm_va + GM_HFI) + 6 + 12 * q;
++}
++
++static uint32_t *
++gm_queue(unsigned q)
++{
++	return (uint32_t *)(gm_va + GM_HFI + HFI_QOFF + 0x1000u * q);
++}
++
++static void
++gm_hfi_sync(void)
++{
++	flush_dcache64((addr64_t)(gm_pa + GM_HFI), GVA_HFI_SIZE, TRUE);
++}
++
++/* Send one command on queue 0 and wait for its ACK on queue 1; ack[] gets the ACK dwords. */
++static int
++gm_hfi_cmd(uint32_t *cmd, unsigned ndw, uint32_t *ack, unsigned ack_max)
++{
++	uint32_t *h = gm_qhdr(0), *q = gm_queue(0);
++	cmd[0] = (cmd[0] & 0xfffffu) | ((++gm_hfi_seq & 0xfffu) << 20);
++	gm_hfi_sync();
++	uint32_t w = h[11], size = h[3];
++	for (unsigned i = 0; i < ndw; i++) {
++		q[w] = cmd[i];
++		w = (w + 1) % size;
++	}
++	for (; w % 4; w = (w + 1) % size) {
++		q[w] = 0xfafafafau;                     /* v2: cookify to a 4-dword boundary */
++	}
++	h[11] = w;
++	gm_hfi_sync();
++	gpu_wr(g_gmu, GMU_HOST2GMU_INTR_SET, 1);
++	uint32_t *mh = gm_qhdr(1), *mq = gm_queue(1);
++	for (unsigned i = 0; i < 1000; i++) {           /* HFI_RSP_TIMEOUT 100 ms */
++		gm_hfi_sync();
++		bool irq = (gpu_rd(g_gmu, GMU_GMU2HOST_INTR_INFO) & 1u) != 0;
++		while (mh[10] != mh[11]) {
++			uint32_t r = mh[10], msz = mh[3];
++			uint32_t hdr = mq[r], n = (hdr >> 8) & 0xffu;
++			for (unsigned j = 0; j < n; j++) {
++				if (j < ack_max) {
++					ack[j] = mq[r];
++				}
++				r = (r + 1) % msz;
++			}
++			mh[10] = ((r + 3u) & ~3u) % msz;  /* v2: ALIGN(read, 4) */
++			gm_hfi_sync();
++			if (irq) {
++				gpu_wr(g_gmu, GMU_GMU2HOST_INTR_CLR, 1);
++			}
++			/* ACK type 1 whose request header carries our sequence number */
++			if (((hdr >> 16) & 0xfu) == 1u && n >= 2 && ack_max >= 2 &&
++			    ((ack[1] >> 20) & 0xfffu) == ((cmd[0] >> 20) & 0xfffu)) {
++				return (int)n;
++			}
++			printf("SWEET GPU: S1 HFI unexpected msg hdr 0x%08x\n", hdr);
++		}
++		delay(100);
++	}
++	return -1;
++}
++
+ static int gm_smmu_cb = -1;
+ static vm_offset_t gm_smmu, gm_cb;
+ 
+@@ -644,9 +722,25 @@
+ 	/* a6xx_gmu_hfi_start */
+ 	gpu_wr(g_gmu, GMU_HFI_CTRL_INIT, 1);
+ 	bool hfi = gpu_poll(g_gmu, GMU_HFI_CTRL_STATUS, 1u, 1u, 1000);
+-	printf("SWEET GPU: S1 HFI %s (status 0x%08x); stage 1 done\n", hfi ? "STARTED" : "start TIMEOUT",
++	printf("SWEET GPU: S1 HFI %s (status 0x%08x)\n", hfi ? "STARTED" : "start TIMEOUT",
+ 	    gpu_rd(g_gmu, GMU_HFI_CTRL_STATUS));
+ 	gm_smmu_fault_report("after HFI start");
++	if (!hfi) {
++		return;
++	}
++	/*
++	 * KGSL hfi_start for a640: no H2F_MSG_INIT; hfi_verify_fw_version sends
++	 * H2F_MSG_FW_VER (id 1) with GMU_VERSION(gpmu_major 2, minor 0). The
++	 * DCVS/BW tables (need cmd-db ARC/BCM data) and CORE_FW_START follow in
++	 * a later stage.
++	 */
++	uint32_t hfi_ver = gpu_rd(g_gmu, GMU_HFI_VERSION_INFO);
++	uint32_t cmd[2] = { (2u << 8) | 1u, 0x20000000u }, ack[8] = { 0 };
++	int n = gm_hfi_cmd(cmd, 2, ack, 8);
++	printf("SWEET GPU: S1 HFI version 0x%08x; FW_VER %s: ack %d dw err %#x gmu fw 0x%08x (major %u minor %#x step %#x)\n",
++	    hfi_ver, n > 0 ? "ACKED" : "no ack", n, ack[2], ack[3], ack[3] >> 28, (ack[3] >> 16) & 0xfffu, ack[3] & 0xffffu);
++	gm_smmu_fault_report("after FW_VER");
++	printf("SWEET GPU: stage 1 done\n");
+ }
+ 
+ /* The GMU block is only safe to read with CX powered and the GMU/AHB clocks running. */
