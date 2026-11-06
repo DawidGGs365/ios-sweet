@@ -1,0 +1,193 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 12:36:36.496968454 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 12:37:26.022605981 +0100
+@@ -396,6 +396,9 @@
+ 	bool pend;                              /* pointer write waiting for its read */
+ 	uint8_t pend_addr, pend_n, pend_buf[3];
+ 	uint32_t last_ev[4];
++	uint32_t erindex;                       /* boot-arg sweetgpier: CH CNTXT_0 ERINDEX */
++	uint32_t err_prev;                      /* last ERROR_LOG value reported */
++	unsigned chk_logs;
+ } gpi;
+ 
+ static void
+@@ -410,6 +413,8 @@
+ 	touch_wr(gpi.regs, reg, (op << 24) | chid);
+ 	for (unsigned i = 0; i < 2500; i++) {          /* Linux CMD_TIMEOUT_MS 250 */
+ 		if (want == 0xffu || GPI_STATE(touch_rd(gpi.regs, state_reg)) == want) {
++			touch_wr(gpi.regs, GPI_GPII_REG(0x230a0u), touch_rd(gpi.regs, GPI_GPII_REG(0x23090u))); /* SRC_CH_IRQ_CLR */
++			touch_wr(gpi.regs, GPI_GPII_REG(0x230a4u), touch_rd(gpi.regs, GPI_GPII_REG(0x23094u))); /* SRC_EV_CH_IRQ_CLR */
+ 			return true;
+ 		}
+ 		delay(100);
+@@ -418,6 +423,26 @@
+ }
+ 
+ /*
++ * 0099: report ERROR_LOG / GLOB_IRQ_STTS whenever they change, tagged with
++ * the init step that just ran, to find where 0x4006010 (s0096/s0097) comes from.
++ */
++static void
++gpi_chk(const char *step)
++{
++	uint32_t err = touch_rd(gpi.regs, GPI_ERROR_LOG);
++	uint32_t glob = touch_rd(gpi.regs, GPI_GPII_REG(0x23100u));
++	if ((err != gpi.err_prev || glob != 0) && gpi.chk_logs < 24) {
++		gpi.chk_logs++;
++		touch_log("SWEET TOUCH: GPI chk %s: err-log %#x glob %#x type %#x src-ch %#x src-ev %#x ev %#x tx %#x rx %#x\n",
++		    step, err, glob, touch_rd(gpi.regs, GPI_GPII_REG(0x23080u)),
++		    touch_rd(gpi.regs, GPI_GPII_REG(0x23090u)), touch_rd(gpi.regs, GPI_GPII_REG(0x23094u)),
++		    touch_rd(gpi.regs, GPI_EV_CNTXT), touch_rd(gpi.regs, GPI_CH_CNTXT(0)),
++		    touch_rd(gpi.regs, GPI_CH_CNTXT(1)));
++	}
++	gpi.err_prev = err;
++}
++
++/*
+  * apps SMMU: the GPI stream must reach physical memory untranslated. The
+  * Qualcomm hypervisor that owns this SMMU turns an S2CR BYPASS write into
+  * FAULT (s0095 read back 0x20000, then the first DMA crashed the phone into
+@@ -503,7 +528,7 @@
+ gpi_ch_config(uint32_t k)
+ {
+ 	uint64_t ring = gpi.pa + (k ? GB_RX : GB_TX);
+-	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0x0, (16u << 24) | ((k ? 0u : 1u) << 3) | 2u);
++	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0x0, (16u << 24) | ((gpi.erindex & 0x1fu) << 14) | ((k ? 0u : 1u) << 3) | 2u);
+ 	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0x4, GB_RING_LEN);
+ 	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0x8, (uint32_t)ring);
+ 	touch_wr(gpi.regs, GPI_CH_CNTXT(k) + 0xc, (uint32_t)(ring >> 32));
+@@ -551,11 +576,22 @@
+ gpi_init(void)
+ {
+ 	gpi.regs = ml_io_map(GPI_PA, GPI_SIZE);
+-	if (!gpi.regs || kmem_alloc_contig(kernel_map, &gpi.va, GB_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		touch_log("SWEET TOUCH: GPI map/alloc failed\n");
++	(void)PE_parse_boot_argn("sweetgpier", &gpi.erindex, sizeof(gpi.erindex));
++	/* Linux hands GPI 32-bit IOVAs; try to keep the rings below 4 GB too. */
++	bool low = true;
++	if (!gpi.regs) {
++		touch_log("SWEET TOUCH: GPI map failed\n");
+ 		return false;
+ 	}
++	if (kmem_alloc_contig(kernel_map, &gpi.va, GB_SIZE, PAGE_MASK, (ppnum_t)(atop_64(0x100000000ULL) - 1u), 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		low = false;
++		if (kmem_alloc_contig(kernel_map, &gpi.va, GB_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			touch_log("SWEET TOUCH: GPI alloc failed\n");
++			return false;
++		}
++	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)gpi.va);
+ 	if (!pn) {
+ 		return false;
+@@ -566,8 +602,10 @@
+ 	}
+ 	uint32_t ev0 = touch_rd(gpi.regs, GPI_EV_CNTXT), tx0 = touch_rd(gpi.regs, GPI_CH_CNTXT(0)),
+ 	    rx0 = touch_rd(gpi.regs, GPI_CH_CNTXT(1));
+-	touch_log("SWEET TOUCH: GPI gpii%u as found: ev %#x tx %#x rx %#x err %#x; buffers at 0x%llx\n",
+-	    GPI_GPII, ev0, tx0, rx0, touch_rd(gpi.regs, GPI_ERROR_LOG), gpi.pa);
++	gpi.err_prev = touch_rd(gpi.regs, GPI_ERROR_LOG);
++	touch_log("SWEET TOUCH: GPI gpii%u as found: ev %#x tx %#x rx %#x err %#x glob %#x; buffers at 0x%llx (%s 4G) erindex %u\n",
++	    GPI_GPII, ev0, tx0, rx0, gpi.err_prev, touch_rd(gpi.regs, GPI_GPII_REG(0x23100u)), gpi.pa,
++	    low ? "below" : "NOT below", gpi.erindex);
+ 	/* Release whatever a boot stage left on this GPII. */
+ 	for (uint32_t k = 0; k < 2; k++) {
+ 		uint32_t s = GPI_STATE(touch_rd(gpi.regs, GPI_CH_CNTXT(k)));
+@@ -604,6 +642,13 @@
+ 	touch_wr(gpi.regs, GPI_ERROR_LOG, 0);
+ 	touch_wr(gpi.regs, GPI_GPII_REG(0x23110u), 0xffffffffu); /* GLOB_IRQ_CLR */
+ 	touch_wr(gpi.regs, GPI_GPII_REG(0x23128u), 0xffffffffu); /* GPII_IRQ_CLR */
++	gpi.err_prev = 0xdeadbeefu;     /* always report the first check */
++	gpi_chk("irq-config");
++	touch_log("SWEET TOUCH: GPI irq regs: type-msk %#x glob-en %#x gpii-en %#x intset %#x ieob-msk %#x ch-msk %#x ev-msk %#x\n",
++	    touch_rd(gpi.regs, GPI_GPII_REG(0x23088u)), touch_rd(gpi.regs, GPI_GPII_REG(0x23108u)),
++	    touch_rd(gpi.regs, GPI_GPII_REG(0x23120u)), touch_rd(gpi.regs, GPI_GPII_REG(0x23180u)),
++	    touch_rd(gpi.regs, GPI_GPII_REG(0x230b8u)), touch_rd(gpi.regs, GPI_GPII_REG(0x23098u)),
++	    touch_rd(gpi.regs, GPI_GPII_REG(0x2309cu)));
+ 
+ 	/* Event ring (gpi_alloc_ev_chan) */
+ 	uint64_t ev = gpi.pa + GB_EV;
+@@ -611,6 +656,7 @@
+ 		touch_log("SWEET TOUCH: GPI event ring allocate timeout (%#x)\n", touch_rd(gpi.regs, GPI_EV_CNTXT));
+ 		return false;
+ 	}
++	gpi_chk("ev-alloc");
+ 	touch_wr(gpi.regs, GPI_EV_CNTXT + 0x0, (16u << 24) | (1u << 16) | 2u);
+ 	touch_wr(gpi.regs, GPI_EV_CNTXT + 0x4, GB_EV_LEN);
+ 	touch_wr(gpi.regs, GPI_EV_CNTXT + 0x8, (uint32_t)ev);
+@@ -624,6 +670,7 @@
+ 	gpi.ev_rp = 0;
+ 	gpi_sync(0, GB_SIZE);
+ 	touch_wr(gpi.regs, GPI_EV_DB, (uint32_t)(ev + GB_EV_LEN - 16u));
++	gpi_chk("ev-db");
+ 
+ 	/* Channels (gpi_alloc_chan) */
+ 	for (uint32_t k = 0; k < 2; k++) {
+@@ -631,11 +678,14 @@
+ 			touch_log("SWEET TOUCH: GPI ch%u allocate timeout (%#x)\n", k, touch_rd(gpi.regs, GPI_CH_CNTXT(k)));
+ 			return false;
+ 		}
++		gpi_chk(k ? "ch1-alloc" : "ch0-alloc");
+ 		gpi_ch_config(k);
++		gpi_chk(k ? "ch1-config" : "ch0-config");
+ 	}
+ 	if (!gpi_ch_start()) {
+ 		return false;
+ 	}
++	gpi_chk("ch-start");
+ 	/* SE side: geni_se_select_gpi_mode */
+ 	touch_wr(st.se, 0xe18, 0);                     /* SE_GSI_EVENT_EN */
+ 	touch_wr(st.se, 0x618, 0xffffffffu);           /* M_IRQ_CLEAR */
+@@ -647,8 +697,11 @@
+ 	touch_wr(st.se, 0x258, 1);                     /* SE_GENI_DMA_MODE_EN */
+ 	touch_wr(st.se, 0xe18, 0xfu);                  /* DMA RX/TX, M, S events to GSI */
+ 	touch_wr(st.se, SE_CLK_SEL, touch_dfs_level);
+-	touch_log("SWEET TOUCH: GPI gpii%u ready: ev %#x tx %#x rx %#x\n", GPI_GPII,
+-	    touch_rd(gpi.regs, GPI_EV_CNTXT), touch_rd(gpi.regs, GPI_CH_CNTXT(0)), touch_rd(gpi.regs, GPI_CH_CNTXT(1)));
++	delay(1000);
++	gpi_chk("se-gsi");
++	touch_log("SWEET TOUCH: GPI gpii%u ready: ev %#x tx %#x rx %#x err-log %#x\n", GPI_GPII,
++	    touch_rd(gpi.regs, GPI_EV_CNTXT), touch_rd(gpi.regs, GPI_CH_CNTXT(0)), touch_rd(gpi.regs, GPI_CH_CNTXT(1)),
++	    touch_rd(gpi.regs, GPI_ERROR_LOG));
+ 	gpi.on = true;
+ 	return true;
+ }
+@@ -710,7 +763,10 @@
+ 	gpi_queue(0, GPI_I2C_WRITE | ((uint32_t)addr << 8) | (stretch ? (1u << 26) : 0u), 0, 0,
+ 	    TRE_GO | TRE_CHAIN);    /* downstream i2c-qcom-geni: write GO rx_len 0 */
+ 	gpi_queue(0, (uint32_t)(gpi.pa + GB_TXBUF), (uint32_t)((gpi.pa + GB_TXBUF) >> 32), nt, TRE_DMA | TRE_IEOT);
++	gpi_chk("before-tx-db");
+ 	gpi_ring(0);
++	delay(200);
++	gpi_chk("tx-db+200us");
+ 	return gpi_wait(0);
+ }
+ 
+@@ -777,6 +833,25 @@
+ 			    touch_rd(gpi.regs, GPI_GPII_REG(0x23080u)), touch_rd(gpi.regs, GPI_GPII_REG(0x23100u)),
+ 			    touch_rd(gpi.regs, GPI_GPII_REG(0x23118u)), touch_rd(gpi.regs, GPI_GPII_REG(0x23090u)),
+ 			    touch_rd(gpi.regs, GPI_EV_CNTXT + 0x10) - (uint32_t)(gpi.pa + GB_EV));
++			if (gpi.chk_logs < 24) {
++				gpi.chk_logs += 4;
++				uint32_t c[8], e[8], t[12];
++				for (unsigned i = 0; i < 8; i++) {
++					c[i] = touch_rd(gpi.regs, GPI_CH_CNTXT(0) + 4u * i);
++					e[i] = touch_rd(gpi.regs, GPI_EV_CNTXT + 4u * i);
++				}
++				uint32_t o = (gpi.tx_wp + GB_RING_LEN - 48u) % GB_RING_LEN;
++				gpi_sync(GB_TX, GB_RING_LEN);
++				for (unsigned i = 0; i < 12; i++) {
++					t[i] = *(volatile uint32_t *)(gpi.va + GB_TX + (o + 4u * i) % GB_RING_LEN);
++				}
++				touch_log("SWEET TOUCH: GPI ch0 ctx %x %x %x %x %x %x %x %x\n",
++				    c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
++				touch_log("SWEET TOUCH: GPI ev ctx %x %x %x %x %x %x %x %x\n",
++				    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++				touch_log("SWEET TOUCH: GPI tx TREs @+%#x %x %x %x %x | %x %x %x %x | %x %x %x %x\n", o,
++				    t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11]);
++			}
+ 		}
+ 		touch_wr(gpi.regs, GPI_ERROR_LOG, 0);
+ 		touch_wr(gpi.regs, GPI_GPII_REG(0x23110u), 0xffffffffu);
