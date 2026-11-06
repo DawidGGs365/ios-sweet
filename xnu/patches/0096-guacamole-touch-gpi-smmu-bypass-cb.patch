@@ -1,0 +1,112 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 08:38:08.263805130 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 08:38:38.820602284 +0100
+@@ -418,9 +418,14 @@
+ }
+ 
+ /*
+- * apps SMMU: the GPI stream must reach physical memory untranslated. Report
+- * what the boot firmware left for SID 0x7b6 and add a bypass stream match
+- * when unmatched streams would fault.
++ * apps SMMU: the GPI stream must reach physical memory untranslated. The
++ * Qualcomm hypervisor that owns this SMMU turns an S2CR BYPASS write into
++ * FAULT (s0095 read back 0x20000, then the first DMA crashed the phone into
++ * crash-dump mode), so do what Linux arm-smmu-qcom.c does for its bypass
++ * quirk: route the stream to the last context bank, programmed as stage-1
++ * translate / stage-2 bypass with SCTLR.M = 0 (no stage-1 translation).
++ * Nothing is accepted without reading the registers back: on any mismatch
++ * the stream entry is removed again and no DMA is started.
+  */
+ static bool
+ gpi_smmu_bypass(void)
+@@ -429,11 +434,24 @@
+ 	if (!smmu) {
+ 		return false;
+ 	}
+-	uint32_t scr0 = touch_rd(smmu, 0x0), idr0 = touch_rd(smmu, 0x20);
+-	uint32_t nsmr = idr0 & 0xffu;
++	uint32_t scr0 = touch_rd(smmu, 0x0), idr0 = touch_rd(smmu, 0x20), idr1 = touch_rd(smmu, 0x24);
++	uint32_t nsmr = idr0 & 0xffu, ncb = idr1 & 0xffu;
++	uint32_t pagesize = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
++	uint32_t numpage = 1u << (((idr1 >> 28) & 7u) + 1u);
++	uint64_t span = (uint64_t)pagesize * numpage * 2u;
++	if (ncb == 0 || ncb > 128u || nsmr > 128u || span > 0x100000u || (scr0 & (1u << 3))) {
++		touch_log("SWEET TOUCH: GPI apps-SMMU unexpected sCR0 %#x IDR0 %#x IDR1 %#x\n", scr0, idr0, idr1);
++		return false;
++	}
++	smmu = ml_io_map(APPS_SMMU_PA, (vm_size_t)span);
++	if (!smmu) {
++		return false;
++	}
++	const uint32_t cb = ncb - 1u;
++	vm_offset_t gr1 = smmu + pagesize, cbr = smmu + (vm_offset_t)pagesize * numpage + (vm_offset_t)cb * pagesize;
+ 	int match = -1, free_idx = -1;
+-	for (uint32_t i = 0; i < nsmr && i < 128u; i++) {
+-		uint32_t smr = touch_rd(smmu, 0x800 + 4 * i);
++	for (uint32_t i = 0; i < nsmr; i++) {
++		uint32_t smr = touch_rd(smmu, 0x800 + 4 * i), s2cr = touch_rd(smmu, 0xc00 + 4 * i);
+ 		if (!(smr & (1u << 31))) {
+ 			if (free_idx < 0) {
+ 				free_idx = (int)i;
+@@ -442,31 +460,42 @@
+ 		}
+ 		uint32_t mask = (smr >> 16) & 0x7fffu;
+ 		if (((smr ^ GPI_SID) & ~mask & 0x7fffu) == 0) {
+-			match = (int)i;
+-			break;
++			if (match < 0) {
++				match = (int)i;
++			}
++		} else if (((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == cb) {
++			touch_log("SWEET TOUCH: GPI apps-SMMU cb%u already used by smr%u %#x; no DMA\n", cb, i, smr);
++			return false;
+ 		}
+ 	}
+ 	if (match >= 0) {
+-		uint32_t s2cr = touch_rd(smmu, 0xc00 + 4 * (uint32_t)match);
+-		uint32_t type = (s2cr >> 16) & 3u;
+-		touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x smr%d %#x s2cr %#x (%s)\n", scr0, match,
+-		    touch_rd(smmu, 0x800 + 4 * (uint32_t)match), s2cr,
+-		    type == 1 ? "bypass" : type == 0 ? "translate" : "fault");
+-		return type == 1;
+-	}
+-	if (!(scr0 & (1u << 10))) {
+-		touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x: SID %#x unmatched, bypass\n", scr0, GPI_SID);
++		uint32_t smr = touch_rd(smmu, 0x800 + 4 * (uint32_t)match);
++		if (smr != ((1u << 31) | GPI_SID)) {
++			touch_log("SWEET TOUCH: GPI apps-SMMU SID %#x shared with smr%d %#x; no DMA\n", GPI_SID, match, smr);
++			return false;
++		}
++	} else if (!(scr0 & (1u << 10))) {
++		touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x: SID %#x unmatched and USFCFG=0 (bypass)\n", scr0, GPI_SID);
+ 		return true;
+-	}
+-	if ((scr0 & (1u << 3)) || free_idx < 0) {
+-		touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x: SID %#x faults, no free SMR (%d)\n", scr0, GPI_SID, free_idx);
++	} else if (free_idx < 0) {
++		touch_log("SWEET TOUCH: GPI apps-SMMU no free SMR; no DMA\n");
+ 		return false;
+ 	}
+-	touch_wr(smmu, 0xc00 + 4 * (uint32_t)free_idx, 1u << 16);            /* S2CR: bypass */
+-	touch_wr(smmu, 0x800 + 4 * (uint32_t)free_idx, (1u << 31) | GPI_SID);
+-	touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x: added smr%d %#x s2cr %#x (bypass)\n", scr0, free_idx,
+-	    touch_rd(smmu, 0x800 + 4 * (uint32_t)free_idx), touch_rd(smmu, 0xc00 + 4 * (uint32_t)free_idx));
+-	return true;
++	const uint32_t idx = (uint32_t)(match >= 0 ? match : free_idx);
++	touch_wr(cbr, 0x0, 0);                                  /* SCTLR: M=0, no stage-1 translation */
++	touch_wr(gr1, 4 * cb, 1u << 16);                        /* CBAR: S1 translate, S2 bypass */
++	touch_wr(smmu, 0xc00 + 4 * idx, cb);                    /* S2CR: translate via cb */
++	touch_wr(smmu, 0x800 + 4 * idx, (1u << 31) | GPI_SID);  /* SMR: exact SID */
++	uint32_t s2cr = touch_rd(smmu, 0xc00 + 4 * idx), smr = touch_rd(smmu, 0x800 + 4 * idx);
++	uint32_t cbar = touch_rd(gr1, 4 * cb), sctlr = touch_rd(cbr, 0x0);
++	bool ok = ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == cb && smr == ((1u << 31) | GPI_SID) &&
++	    ((cbar >> 16) & 3u) == 1u && !(sctlr & 1u);
++	touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x smr%u %#x s2cr %#x -> cb%u cbar %#x sctlr %#x: %s\n",
++	    scr0, idx, smr, s2cr, cb, cbar, sctlr, ok ? "bypass via cb" : "REJECTED, no DMA");
++	if (!ok) {
++		touch_wr(smmu, 0x800 + 4 * idx, 0);             /* drop the stream entry again */
++	}
++	return ok;
+ }
+ 
+ /* Channel context: TX dir out (1), RX dir in (0), protocol GPI, event ring 0; ring rewinds. */
