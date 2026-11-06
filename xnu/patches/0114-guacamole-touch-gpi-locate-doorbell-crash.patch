@@ -1,0 +1,78 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 3da080b..981ae8a 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -804,6 +804,52 @@ gpi_doorbell_allowed(const char *what)
+ /* 400 kHz from 19.2 MHz (Linux geni_i2c_clk_map): div 2, high 5, low 12, cycle 24, TX/RX packing. */
+ #define GPI_I2C_CONFIG0         (12u | (5u << 8) | (24u << 16) | (1u << 24) | (1u << 25))
+ 
++/*
++ * 0114: s0113 (SE io-init on, bus idle high, S6SY761 IRQ asserted) died
++ * within ~100 ms of the first doorbell; the "after write phase" line never
++ * left. Locate it: after doorbell 1 touch nothing for 0.5 s, look at the
++ * event ring in DDR only (no MMIO), then read one register block at a time,
++ * each preceded by a flushed log line. The last "GPI step" line in the log
++ * names what the SoC died on.
++ */
++#define GPI_STEP(what) do { touch_log("SWEET TOUCH: GPI step: %s\n", what); delay(300000); } while (0)
++
++static void
++gpi_locate(void)
++{
++	delay(500000);
++	GPI_STEP("alive 0.5 s after doorbell 1, no MMIO since; reading event ring (DDR)");
++	gpi_sync(GB_EV, 64);
++	const volatile uint32_t *e = (const volatile uint32_t *)(gpi.va + GB_EV + gpi.ev_rp);
++	touch_log("SWEET TOUCH: GPI step: ev mem @+%#x %08x %08x %08x %08x (type %#x code %u)\n", gpi.ev_rp,
++	    e[0], e[1], e[2], e[3], (e[3] >> 16) & 0xffu, e[2] >> 24);
++	delay(300000);
++	GPI_STEP("next: GPI ch0 context");
++	uint32_t c0 = touch_rd(gpi.regs, GPI_CH_CNTXT(0)), crp = touch_rd(gpi.regs, GPI_CH_CNTXT(0) + 0x10);
++	touch_log("SWEET TOUCH: GPI step: ch0 %#x rp %#x\n", c0, crp);
++	delay(300000);
++	GPI_STEP("next: GPI event context / error log");
++	uint32_t erp = touch_rd(gpi.regs, GPI_EV_CNTXT + 0x10), el = touch_rd(gpi.regs, GPI_ERROR_LOG);
++	touch_log("SWEET TOUCH: GPI step: ev rp %#x err-log %#x\n", erp, el);
++	delay(300000);
++	GPI_STEP("next: GPII irq status");
++	uint32_t ty = touch_rd(gpi.regs, GPI_GPII_REG(0x23080u)), gl = touch_rd(gpi.regs, GPI_GPII_REG(0x23100u));
++	touch_log("SWEET TOUCH: GPI step: irq type %#x glob %#x\n", ty, gl);
++	delay(300000);
++	GPI_STEP("next: SE status / m-irq / ios");
++	uint32_t ss = touch_rd(st.se, SE_STATUS), mi = touch_rd(st.se, 0x610), io = touch_rd(st.se, 0x908);
++	touch_log("SWEET TOUCH: GPI step: se status %#x m-irq %#x ios %#x\n", ss, mi, io);
++	delay(300000);
++	GPI_STEP("next: TLMM SDA/SCL/IRQ");
++	touch_log("SWEET TOUCH: GPI step: sda %u scl %u irq %u\n", touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_SDA)) & 1u,
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_SCL)) & 1u, touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_IRQ)) & 1u);
++	delay(300000);
++	GPI_STEP("next: apps-SMMU cb fault state");
++	gpi_smmu_state("step smmu");
++	delay(300000);
++	GPI_STEP("all reads survived; continuing with the normal wait");
++}
++
+ static int
+ gpi_write_phase(uint8_t addr, const uint8_t *tx, unsigned nt, bool stretch)
+ {
+@@ -818,6 +864,9 @@ gpi_write_phase(uint8_t addr, const uint8_t *tx, unsigned nt, bool stretch)
+ 		return ENXIO;
+ 	}
+ 	gpi_ring(0);
++	if (st.probing && gpi.doorbells == 1) {
++		gpi_locate();
++	}
+ 	delay(200);
+ 	gpi_chk("tx-db+200us");
+ 	int err = gpi_wait(0);
+@@ -938,8 +987,8 @@ gpi_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr,
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_SDA)) & 1u, touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_SCL)) & 1u);
+ 		/*
+ 		 * 0113: s0112 died (EDL) on the next doorbell after the error and
+-		 * s0112b, with doorbells blocked, still died right after the
+-		 * restart below. Re-arming an errored GPII is not safe here, so by
++		 * s0112b, with doorbells blocked, still died soon after this
++		 * restart path. Re-arming an errored GPII is not safe here, so by
+ 		 * default the first transfer error ends touch for this boot and
+ 		 * the GPI is left alone. sweetgpiretry=1 restores the restart,
+ 		 * with a flushed log line before each step.
