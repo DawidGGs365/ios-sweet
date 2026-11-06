@@ -1,0 +1,89 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 981ae8a..d1e8392 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -410,6 +410,74 @@ gpi_chk(const char *step)
+  * Nothing is accepted without reading the registers back: on any mismatch
+  * the stream entry is removed again and no DMA is started.
+  */
++/*
++ * 0115: the GPI (SID 0x7b6) only fetches TREs and writes events; the I2C
++ * data of a DMA TRE is moved by the QUP2 wrapper's SE DMA, which masters
++ * with its own stream ID (stock DT qupv3_2 iommu_qupv3_2_geni_se_cb:
++ * apps_smmu 0x7a3, qcom,iommu-s1-bypass; downstream i2c-qcom-geni maps the
++ * message buffers on the wrapper device). That stream had no SMR, and with
++ * sCR0.USFCFG=1 an unmatched stream faults: s0112 (SE DMA clocks still
++ * gated) only got UNEXP_ERR, s0113/s0114 (io-init) died < 0.5 s after
++ * doorbell 1 with no CPU access at all. Route SID 0x7a3 to the GPI's
++ * context bank too, so the IOVAs in the DMA TREs translate the same way
++ * for both masters. boot-arg sweetqupsid=0 skips it.
++ */
++#define QUP2_SE_SID             0x7a3u
++
++static bool
++gpi_smmu_se_sid(vm_offset_t smmu, uint32_t cb, uint32_t gpi_idx, uint32_t nsmr)
++{
++	unsigned on = 1;
++	(void)PE_parse_boot_argn("sweetqupsid", &on, sizeof(on));
++	if (!on) {
++		touch_log("SWEET TOUCH: GPI apps-SMMU QUP2 SE SID %#x not routed (sweetqupsid=0)\n", QUP2_SE_SID);
++		return true;
++	}
++	int match = -1, free_idx = -1;
++	for (uint32_t i = 0; i < nsmr; i++) {
++		if (i == gpi_idx) {
++			continue;
++		}
++		uint32_t smr = touch_rd(smmu, 0x800 + 4 * i);
++		if (!(smr & (1u << 31))) {
++			if (free_idx < 0) {
++				free_idx = (int)i;
++			}
++			continue;
++		}
++		uint32_t mask = (smr >> 16) & 0x7fffu;
++		if (match < 0 && ((smr ^ QUP2_SE_SID) & ~mask & 0x7fffu) == 0) {
++			match = (int)i;
++		}
++	}
++	uint32_t idx;
++	if (match >= 0) {
++		uint32_t smr = touch_rd(smmu, 0x800 + 4 * (uint32_t)match);
++		touch_log("SWEET TOUCH: GPI apps-SMMU QUP2 SE SID %#x already in smr%d %#x s2cr %#x\n", QUP2_SE_SID, match,
++		    smr, touch_rd(smmu, 0xc00 + 4 * (uint32_t)match));
++		if (smr != ((1u << 31) | QUP2_SE_SID)) {
++			touch_log("SWEET TOUCH: GPI apps-SMMU QUP2 SE SID shared with other streams; no DMA\n");
++			return false;
++		}
++		idx = (uint32_t)match;
++	} else if (free_idx < 0) {
++		touch_log("SWEET TOUCH: GPI apps-SMMU no free SMR for QUP2 SE SID; no DMA\n");
++		return false;
++	} else {
++		idx = (uint32_t)free_idx;
++	}
++	touch_wr(smmu, 0xc00 + 4 * idx, cb);                    /* S2CR: translate via the GPI cb */
++	touch_wr(smmu, 0x800 + 4 * idx, (1u << 31) | QUP2_SE_SID);
++	uint32_t s2cr = touch_rd(smmu, 0xc00 + 4 * idx), smr = touch_rd(smmu, 0x800 + 4 * idx);
++	bool ok = ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == cb && smr == ((1u << 31) | QUP2_SE_SID);
++	touch_log("SWEET TOUCH: GPI apps-SMMU QUP2 SE SID %#x -> smr%u %#x s2cr %#x cb%u: %s\n", QUP2_SE_SID, idx, smr, s2cr, cb,
++	    ok ? "shares the GPI tables" : "REJECTED, no DMA");
++	if (!ok) {
++		touch_wr(smmu, 0x800 + 4 * idx, 0);
++	}
++	return ok;
++}
++
+ static bool
+ gpi_smmu_bypass(void)
+ {
+@@ -508,6 +576,9 @@ gpi_smmu_bypass(void)
+ 	gpi.smmu = smmu;
+ 	touch_log("SWEET TOUCH: GPI apps-SMMU sCR0 %#x smr%u %#x s2cr %#x -> cb%u cbar %#x sctlr %#x ttbr 0x%llx iova %#x: %s\n",
+ 	    scr0, idx, smr, s2cr, cb, cbar, sctlr, gpi.pt_pa, GPI_IOVA, ok ? "S1 translation" : "REJECTED, no DMA");
++	if (ok && !gpi_smmu_se_sid(smmu, cb, idx, nsmr)) {
++		ok = false;
++	}
+ 	if (!ok) {
+ 		touch_wr(smmu, 0x800 + 4 * idx, 0);             /* drop the stream entry again */
+ 		gpi.cb = 0;
