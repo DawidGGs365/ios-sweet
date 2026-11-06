@@ -167,7 +167,7 @@ diff --color -ruN a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
  extern void sweet_hid_key(int key, int down);
  extern bool sweet_hid_ringer(int ring);
 +extern uint32_t processor_avail_count;          /* osfmk/kern/processor.c */
-+extern uint64_t max_mem;                        /* osfmk/mach/vm_param.h */
++extern uint64_t max_mem; extern unsigned int ml_get_max_cpus(void); /* not exported to BSD */
  extern unsigned sweet_hid_button_clients(void);
  void sweet_keys_init(void);
  
