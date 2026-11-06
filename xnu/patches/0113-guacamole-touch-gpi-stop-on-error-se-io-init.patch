@@ -1,0 +1,115 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 6341643..5110bc3 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -925,13 +925,48 @@ gpi_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr,
+ 				    t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11]);
+ 			}
+ 		}
++		/*
++		 * 0113: the GPI only says "unexpected error" (code 16); the I2C
++		 * cause is latched in the SE's own M_IRQ_STATUS even in GSI mode
++		 * (GP_IRQ1 NACK, GP_IRQ3 bus protocol, GP_IRQ4 arbitration lost).
++		 */
++		uint32_t m = touch_rd(st.se, 0x610), ios = touch_rd(st.se, 0x908);
++		touch_log("SWEET TOUCH: GPI xfer SE m-irq %#x (%s%s%s%s) s-irq %#x dma-tx %#x dma-rx %#x status %#x ios %#x (sda %u scl %u)\n",
++		    m, (m & (1u << 10)) ? "NACK " : "", (m & (1u << 12)) ? "BUS-PROTO " : "",
++		    (m & (1u << 13)) ? "ARB-LOST " : "", (m & ((1u << 10) | (1u << 12) | (1u << 13))) ? "" : "no i2c error bit",
++		    touch_rd(st.se, 0x640), touch_rd(st.se, 0xc40), touch_rd(st.se, 0xd40), touch_rd(st.se, SE_STATUS), ios,
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_SDA)) & 1u, touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_SCL)) & 1u);
++		/*
++		 * 0113: s0112 died (EDL) on the next doorbell after the error and
++		 * s0112b, with doorbells blocked, still died soon after this
++		 * restart path. Re-arming an errored GPII is not safe here, so by
++		 * default the first transfer error ends touch for this boot and
++		 * the GPI is left alone. sweetgpiretry=1 restores the restart,
++		 * with a flushed log line before each step.
++		 */
++		unsigned retry = 0;
++		(void)PE_parse_boot_argn("sweetgpiretry", &retry, sizeof(retry));
++		if (!retry) {
++			touch_log("SWEET TOUCH: GPI transfer error; touch DMA stopped for this boot (sweetgpiretry=1 retries)\n");
++			st.dead = true;
++			return err;
++		}
++		touch_log("SWEET TOUCH: GPI retry: clearing error/IRQ state\n");
++		delay(300000);
+ 		touch_wr(gpi.regs, GPI_ERROR_LOG, 0);
+ 		touch_wr(gpi.regs, GPI_GPII_REG(0x23110u), 0xffffffffu);
+ 		touch_wr(gpi.regs, GPI_GPII_REG(0x23128u), 0xffffffffu);
+ 		touch_wr(gpi.regs, GPI_GPII_REG(0x230a0u), 0xffffffffu); /* SRC_CH_IRQ_CLR */
+ 		touch_wr(gpi.regs, GPI_GPII_REG(0x230a4u), 0xffffffffu); /* SRC_EV_CH_IRQ_CLR */
+ 		touch_wr(gpi.regs, GPI_GPII_REG(0x230c0u), 0xffffffffu); /* SRC_IEOB_IRQ_CLR */
+-		if (!gpi_restart()) {
++		touch_log("SWEET TOUCH: GPI retry: restarting channels (ch0 %#x ch1 %#x)\n",
++		    touch_rd(gpi.regs, GPI_CH_CNTXT(0)), touch_rd(gpi.regs, GPI_CH_CNTXT(1)));
++		delay(300000);
++		bool ok = gpi_restart();
++		touch_log("SWEET TOUCH: GPI retry: restart %s (ch0 %#x ch1 %#x)\n", ok ? "ok" : "FAILED",
++		    touch_rd(gpi.regs, GPI_CH_CNTXT(0)), touch_rd(gpi.regs, GPI_CH_CNTXT(1)));
++		delay(300000);
++		if (!ok) {
+ 			st.dead = true;
+ 		}
+ 	}
+@@ -1073,6 +1108,21 @@ touch_report(uint32_t mask, const int *x, const int *y)
+ 	st.active = mask;
+ }
+ 
++/*
++ * 0113: downstream geni_se_init() -> geni_se_io_init(): clock gating
++ * overrides, DMA AHB clocks, pad output enables and FORCE_DEFAULT. The FIFO
++ * path always did this; the GSI path (SE17) never did, so the SE may not
++ * have been driving SCL/SDA at all when s0112's first GPI write failed.
++ */
++static void
++touch_se_io_init(void)
++{
++	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);    /* GENI_CGC_CTRL */
++	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);  /* SE_DMA_GENERAL_CFG */
++	touch_wr(st.se, 0x24, 0x7f);                             /* GENI_OUTPUT_CTRL */
++	touch_wr(st.se, 0x20, 1);                                /* GENI_FORCE_DEFAULT_REG */
++}
++
+ static bool
+ touch_se_init(void)
+ {
+@@ -1091,6 +1141,13 @@ touch_se_init(void)
+ 	const uint32_t ifdis = touch_rd(st.se, 0x64);
+ 	if (((fw >> 8) & 0xffu) == 3u && (ifdis & 1u)) {
+ 		touch_log("SWEET TOUCH: SE17 FIFO interface disabled (fw=%#x ifdis=%#x): using GPI DMA\n", fw, ifdis);
++		unsigned io = 1;
++		(void)PE_parse_boot_argn("sweetgpiio", &io, sizeof(io));
++		if (io) {
++			touch_se_io_init();
++		}
++		touch_log("SWEET TOUCH: SE io-init %s: cgc %#x dma-cfg %#x out-ctrl %#x\n", io ? "done" : "skipped (sweetgpiio=0)",
++		    touch_rd(st.se, 0x28), touch_rd(st.se, 0xe30), touch_rd(st.se, 0x24));
+ 		return gpi_init();
+ 	}
+ 	const bool fifo_ok = ((tx >> 24) & 0x3fu) == 32u && ((rx >> 24) & 0x3fu) == 32u &&
+@@ -1113,10 +1170,7 @@ touch_se_init(void)
+ 	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+ 	touch_wr(st.se, 0x648, 0xffffffffu);
+ 	touch_wr(st.se, SE_DMA, 0);
+-	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
+-	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+-	touch_wr(st.se, 0x24, 0x7f);
+-	touch_wr(st.se, 0x20, 1);
++	touch_se_io_init();
+ 	touch_wr(st.se, SE_CLK_SEL, touch_dfs_level);
+ 	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+ 	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+@@ -1235,6 +1289,12 @@ touch_guacamole(void)
+ 	touch_gpio(GUAC_SCL, 1, 0, 0, false, false);
+ 	touch_gpio(GUAC_RST, 0, 0, 3, true, true);
+ 	touch_wait(150); /* OnePlus RESET_TO_NORMAL_TIME 70 ms, Linux 140 ms */
++	/* 0113: an idle I2C bus reads high on both lines (pull-ups on the 1.8 V switch). */
++	uint32_t sda = touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_SDA)) & 1u, scl = touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_SCL)) & 1u;
++	touch_log("SWEET TOUCH: bus idle sda %u scl %u rst-io %#x 1v8-io %#x irq-io %#x se ios %#x%s\n", sda, scl,
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_RST)), touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_1V8)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(GUAC_IRQ)), touch_rd(st.se, 0x908),
++	    (sda && scl) ? "" : " - LINE LOW: no pull-up / 1.8 V or a stuck device");
+ 
+ 	uint8_t ev[8] = {0};
+ 	bool boot = false;
