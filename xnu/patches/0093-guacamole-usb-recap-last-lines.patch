@@ -1,0 +1,79 @@
+diff --color -ruN a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c	2026-11-06 07:30:57.393056212 +0100
++++ b/bsd/dev/sweet_usb.c	2026-11-06 07:31:24.874461692 +0100
+@@ -37,12 +37,62 @@
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
++#include <stdarg.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);     /* bsd/dev/sweet_rpmh.c */
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t thread_terminate(thread_t);
++
++/*
++ * guacamole: the GUI covers the boot console before the USB lines can be
++ * read, and the USB console is what is being debugged. Keep the last few
++ * SWEET USB lines and re-print them every 5 s (usb_recap_thread).
++ * Unlocked: a race can only garble a log line.
++ */
++#define USB_RECAP_LINES 8
++static char usb_recent[USB_RECAP_LINES][200];
++static unsigned usb_recent_n;
++
++static void
++usb_log(const char *fmt, ...) __printflike(1, 2);
++static void
++usb_log(const char *fmt, ...)
++{
++	va_list ap;
++	char *line = usb_recent[usb_recent_n++ % USB_RECAP_LINES];
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(usb_recent[0]), fmt, ap);
++	va_end(ap);
++	printf("%s", line);
++}
++#define printf usb_log
++
++static int usb_recap_chan;
++
++static void
++usb_recap_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (unsigned round = 1; round <= 120; round++) {
++		uint64_t deadline;
++		clock_interval_to_deadline(5000, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&usb_recap_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		unsigned n = usb_recent_n;
++		unsigned first = n > USB_RECAP_LINES ? n - USB_RECAP_LINES : 0;
++		/* real printf: the recap itself is not recorded */
++#undef printf
++		printf("SWEET USB RECAP %u: %u lines logged%s\n", round, n, n ? ", last ones:" : "");
++		for (unsigned i = first; i < n; i++) {
++			printf("  USB#%u %s", i + 1, usb_recent[i % USB_RECAP_LINES]);
++		}
++#define printf usb_log
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+@@ -353,6 +403,12 @@
+ 		return;
+ 	}
+ 	usb_soc_select();
++	if (usb_guac && enabled >= 2) {
++		thread_t recap;
++		if (kernel_thread_start(usb_recap_thread, NULL, &recap) == KERN_SUCCESS) {
++			thread_deallocate(recap);
++		}
++	}
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
