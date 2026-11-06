@@ -1,0 +1,68 @@
+diff --color -ruN a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c	2026-11-06 12:57:54.051662687 +0100
++++ b/bsd/dev/sweet_gpu.c	2026-11-06 12:57:54.052286672 +0100
+@@ -49,6 +49,7 @@
+ #define GCC_GPU_CFG_AHB         0x71004
+ #define GCC_GPU_MEMNOC_GFX      0x7100c
+ #define GCC_GPU_SNOC_DVM_GFX    0x71018
++#define GCC_DDRSS_GPU_AXI       0x71154         /* KGSL gmu "axi_clk" (GCC_DDRSS_GPU_AXI_CLK) */
+ 
+ /* GPU CC (gpucc-sm8150.c) */
+ #define GPUCC_GX_GDSCR          0x100c
+@@ -597,14 +598,26 @@
+ 	gpu_wr(g_gmu, GMU_RPMH_CTRL, gpu_rd(g_gmu, GMU_RPMH_CTRL) | 0x1u | 0x10u | 0x100u | 0x200u | 0x400u | 0x800u);
+ 	/* a6xx_gmu_start */
+ 	uint32_t ver = gpu_rd(g_gmu, GMU_DTCM + 0x3fe0);
+-	uint32_t mask = ver <= 0x20010004u ? 0xffffffffu : 0x1ffu, want = ver <= 0x20010004u ? 0xbabefaceu : 0x100u;
+ 	gpu_wr(g_gmu, GMU_CM3_SYSRESET, 1);
+ 	gpu_wr(g_gmu, GMU_PWR_COL_CP_RESP, 0);
+ 	gpu_wr(g_gmu, 0x5002u << 2, 0);                         /* KGSL A6XX_GMU_CX_GMU_WFI_CONFIG */
+ 	gpu_wr(g_gmu, GMU_CM3_SYSRESET, 0);
+-	bool up = gpu_poll(g_gmu, GMU_CM3_FW_INIT_RESULT, mask, want, 1000);
+-	printf("SWEET GPU: S1 GMU %s: fw-init 0x%08x (want 0x%x/0x%x) rpmh-state 0x%08x\n", up ? "BOOTED" : "boot TIMEOUT",
+-	    gpu_rd(g_gmu, GMU_CM3_FW_INIT_RESULT), want, mask, gpu_rd(g_gmu, GMU_CX_RPMH_POWER_STATE));
++	/*
++	 * 0101: the stock OOS12 KGSL boots this same a640_gmu.bin and waits for
++	 * 0xBABEFACE (full mask) regardless of version; newer mainline firmware
++	 * reports (v & 0x1ff) == 0x100. Accept either.
++	 */
++	bool up = false;
++	uint32_t init = 0;
++	for (unsigned i = 0; i <= 10000u && !up; i++) {
++		init = gpu_rd(g_gmu, GMU_CM3_FW_INIT_RESULT);
++		up = init == 0xbabefaceu || (init & 0x1ffu) == 0x100u;
++		if (!up) {
++			delay(100);
++		}
++	}
++	printf("SWEET GPU: S1 GMU %s: fw-init 0x%08x (fw ver 0x%08x) rpmh-state 0x%08x\n", up ? "BOOTED" : "boot TIMEOUT",
++	    init, ver, gpu_rd(g_gmu, GMU_CX_RPMH_POWER_STATE));
+ 	gm_smmu_fault_report("after GMU boot");
+ 	if (!up) {
+ 		return;
+@@ -659,6 +672,8 @@
+ 		gpu_wr(g_gcc, GCC_GPU_VOTE, gpu_rd(g_gcc, GCC_GPU_VOTE) | (1u << 15) | (1u << 16));
+ 		(void)gpu_branch_on(g_gcc, GCC_GPU_MEMNOC_GFX, true);
+ 		(void)gpu_branch_on(g_gcc, GCC_GPU_SNOC_DVM_GFX, true);
++		/* 0101: stock DT gmu clocks include axi_clk = GCC_DDRSS_GPU_AXI_CLK (GPU -> DDR AXI). */
++		(void)gpu_branch_on(g_gcc, GCC_DDRSS_GPU_AXI, true);
+ 		uint32_t g = gpu_rd(g_cc, GPUCC_CX_GDSCR);
+ 		if (!(g & GDSC_PWR_ON)) {
+ 			gpu_wr(g_cc, GPUCC_CX_GDSCR, g & ~GDSC_SW_COLLAPSE);
+@@ -672,6 +687,16 @@
+ 		}
+ 		(void)gpu_branch_on(g_cc, GPUCC_AHB, false);
+ 		(void)gpu_branch_on(g_cc, GPUCC_CXO, true);
++		/*
++		 * 0101: KGSL gmu_enable_clks sets gmu_clk to qcom,gmu-freq 200 MHz
++		 * (gpucc-sm8150 ftbl: GPLL0_OUT_MAIN_DIV src 6, div 1.5 -> hid 2;
++		 * allowed at VDD_MIN). GCC_GPU_VOTE bit 16 above enables the div.
++		 */
++		gpu_wr(g_cc, GPUCC_GMU_RCG + 4, (6u << 8) | 2u);
++		gpu_wr(g_cc, GPUCC_GMU_RCG, gpu_rd(g_cc, GPUCC_GMU_RCG) | 1u);
++		bool rcg_ok = gpu_poll(g_cc, GPUCC_GMU_RCG, 1u, 0u, 5);
++		printf("SWEET GPU: GMU clk 200 MHz %s (cmd 0x%08x cfg 0x%08x)\n", rcg_ok ? "set" : "UPDATE TIMEOUT",
++		    gpu_rd(g_cc, GPUCC_GMU_RCG), gpu_rd(g_cc, GPUCC_GMU_RCG + 4));
+ 		(void)gpu_branch_on(g_cc, GPUCC_CX_GMU, true);
+ 		(void)gpu_branch_on(g_cc, GPUCC_CX_APB, true);
+ 		(void)gpu_branch_on(g_cc, GPUCC_CX_SNOC_DVM, true);
