@@ -1,12 +1,7 @@
 guacamole power: RPMh rails (touch L17A, USB PHY), SPMI, PM8150 RTC, PM8150B battery
 
 Squashed from (in order):
-  0085-guacamole-s6sy761-touch
-  0095-guacamole-gpu-stage5-hfi
-  0133-guacamole-pm8150-rtc
-  0136-guacamole-pm8150b-battery
-  0138-guacamole-pmem-rpmh
-  0144-guacamole-usb-live-log-from-unixnu
+  squashed 0082-0091 (= 0144 state)
 
 diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
 index 4da50d8..b6b663e 100644

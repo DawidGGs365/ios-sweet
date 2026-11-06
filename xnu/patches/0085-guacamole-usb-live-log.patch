@@ -1,7 +1,7 @@
 guacamole USB live log: SM8150 USB clocks, SNPS femto PHY power-up, ECM live log
 
 Squashed from (in order):
-  0144-guacamole-usb-live-log-from-unixnu
+  squashed 0082-0091 (= 0144 state)
 
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
 index b6c1a41..4205589 100644

@@ -1,12 +1,347 @@
-guacamole display: early framebuffer geometry, iPhone X scaled to 1440x3120, empty IOAcceleratorES, 60 Hz timing
+guacamole display: early framebuffer geometry, iPhone X scaled to 1440x3120, empty IOAcceleratorES, 60 Hz timing, DSI DCS brightness + SweetBacklight
 
 Squashed from (in order):
-  0082-guacamole-early-fb-geometry
-  0083-guacamole-scale-up-iphone-x-display
-  0088-guacamole-empty-ioacceleratores
-  0131-guacamole-zero-copy-surfaces
-  0132-guacamole-wrap-offset-black-off-fb-timing
+  squashed 0082-0091 (= 0144 state)
+  0092-guacamole-alert-slider-and-dsi-brightness (ported from unixnu 0104/0107)
 
+diff --git a/bsd/dev/sweet_dsi.c b/bsd/dev/sweet_dsi.c
+new file mode 100644
+index 0000000..33fe763
+--- /dev/null
++++ b/bsd/dev/sweet_dsi.c
+@@ -0,0 +1,194 @@
++/*
++ * guacamole panel commands over DSI0 (0xae94000): Samsung S6E3HC2 "samsung
++ * dsc cmd mode oneplus dsi panel" (stock dtbo 18821), command mode + DSC,
++ * left running by UEFI. Commands go through the DSI test-pattern-generator
++ * DMA FIFO exactly like Linux dsi_ctrl_hw_cmn_kickoff_fifo_command(): no
++ * command buffer in memory, so no SMMU mapping is involved.
++ *
++ * Brightness: DCS 0x51 with a 2-byte big-endian level (bl_ctrl_dcs),
++ * 1..0x3ff normal range (qcom,mdss-dsi-bl-normal-max-level). HBM levels
++ * above 0x3ff are refused here.
++ *
++ * boot-arg sweetbl=N (1..1023): set brightness N once, sweetbldelay seconds
++ * (default 60) after boot, to verify the path without the GUI.
++ * sweetdsi=0 disables all DSI writes.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_dsi_set_brightness(unsigned level);
++void sweet_dsi_init(void);
++
++#define DSI0_PA                 0x0ae94000u
++#define DSI_HW_VERSION          0x000u
++#define DSI_CTRL                0x004u
++#define DSI_CMD_DMA_CTRL        0x03cu
++#define DSI_DMA_CMD_LENGTH      0x04cu
++#define DSI_CMD_DMA_SW_TRIGGER  0x090u
++#define DSI_INT_CTRL            0x110u
++#define DSI_TPG_CTRL            0x15cu
++#define DSI_TPG_CMD_DMA_INIT    0x17cu
++#define DSI_TPG_FIFO_STATUS     0x1dcu
++#define DSI_TPG_FIFO_RESET      0x1ecu
++
++static vm_offset_t d_base;
++static bool d_ok, d_dead;
++static unsigned d_lock;
++static int d_sleep_chan;
++
++static uint32_t
++dsi_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(d_base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++dsi_wr(uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(d_base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool
++dsi_setup(void)
++{
++	int enabled = 1;
++	(void)PE_parse_boot_argn("sweetdsi", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return false;
++	}
++	if (!d_base) {
++		d_base = ml_io_map(DSI0_PA, 0x400);
++	}
++	if (!d_base) {
++		return false;
++	}
++	uint32_t ver = dsi_rd(DSI_HW_VERSION), ctrl = dsi_rd(DSI_CTRL);
++	/* DSI_CTRL bit0 controller enable, bit2 command mode enable. */
++	d_ok = ver != 0 && ver != 0xffffffffu && (ctrl & 1u) && (ctrl & 4u);
++	printf("SWEET DSI: dsi0 version %#x ctrl %#x dma-ctrl %#x int %#x tpg %#x -> %s\n",
++	    ver, ctrl, dsi_rd(DSI_CMD_DMA_CTRL), dsi_rd(DSI_INT_CTRL), dsi_rd(DSI_TPG_CTRL),
++	    d_ok ? "command mode, usable" : "not in command mode; no writes");
++	return d_ok;
++}
++
++/*
++ * Send one embedded-mode packet (Qualcomm header byte order: data0/wc_lo,
++ * data1/wc_hi, vc<<6|dtype, flags bit6 long, bit7 last) through the TPG
++ * FIFO. words: header + payload dwords, at most 64 bytes.
++ */
++static int
++dsi_send(const uint32_t *words, unsigned n)
++{
++	if (!d_ok || d_dead || n == 0 || n > 16) {
++		return ENODEV;
++	}
++	if (__atomic_exchange_n(&d_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	uint32_t dma_ctrl = dsi_rd(DSI_CMD_DMA_CTRL);
++	uint32_t intr = dsi_rd(DSI_INT_CTRL);
++	/* Clear only CMD_MODE_DMA_DONE (bit 0); keep every mask/enable (odd bits). */
++	dsi_wr(DSI_INT_CTRL, (intr & 0xaaaaaaaau) | 1u);
++	/* CMD_DMA_TPG_EN | TPG_DMA_FIFO_MODE | CMD_DMA_PATTERN_SEL custom */
++	dsi_wr(DSI_TPG_CTRL, (1u << 1) | (1u << 2) | (3u << 16));
++	for (unsigned i = 0; i < n; i++) {
++		dsi_wr(DSI_TPG_CMD_DMA_INIT, words[i]);
++	}
++	if (n & 1u) {
++		dsi_wr(DSI_TPG_CMD_DMA_INIT, 0);        /* HW needs an even dword count */
++	}
++	/* EMBEDDED_MODE (bit 28), no broadcast, high-speed (bit 26 clear) like Linux backlight. */
++	dsi_wr(DSI_CMD_DMA_CTRL, (dma_ctrl & ~((1u << 31) | (1u << 30) | (1u << 26))) | (1u << 28));
++	dsi_wr(DSI_DMA_CMD_LENGTH, n * 4u);
++	dsi_wr(DSI_CMD_DMA_SW_TRIGGER, 1);
++	bool done = false;
++	for (unsigned i = 0; i < 5000 && !done; i++) {   /* Linux DSI_CTRL_TX_TO_MS 1200; 50 ms here */
++		done = (dsi_rd(DSI_INT_CTRL) & 1u) != 0;
++		if (!done) {
++			delay(10);
++		}
++	}
++	uint32_t fifo = dsi_rd(DSI_TPG_FIFO_STATUS);
++	/* dsi_ctrl_hw_cmn_reset_cmd_fifo() */
++	dsi_wr(DSI_TPG_CTRL, 0);
++	dsi_wr(DSI_TPG_FIFO_RESET, 1);
++	delay(1);
++	dsi_wr(DSI_TPG_FIFO_RESET, 0);
++	dsi_wr(DSI_INT_CTRL, (dsi_rd(DSI_INT_CTRL) & 0xaaaaaaaau) | 1u);
++	dsi_wr(DSI_CMD_DMA_CTRL, dma_ctrl);
++	if (!done) {
++		/* Never retry blindly: a stuck DMA engine could fight UEFI's scanout. */
++		d_dead = true;
++		printf("SWEET DSI: command DMA not done (int %#x fifo %#x); DSI writes disabled\n",
++		    dsi_rd(DSI_INT_CTRL), fifo);
++	}
++	__atomic_store_n(&d_lock, 0, __ATOMIC_RELEASE);
++	return done ? 0 : ETIMEDOUT;
++}
++
++int
++sweet_dsi_set_brightness(unsigned level)
++{
++	if (level < 1 || level > 0x3ff) {
++		return EINVAL;
++	}
++	if (!d_ok && !dsi_setup()) {
++		return ENODEV;
++	}
++	/* DCS long write (0x39), 3 bytes: 0x51 hi lo; last command; pad 0xff. */
++	const uint32_t words[2] = {
++		(1u << 31) | (1u << 30) | (0x39u << 16) | 3u,
++		0xff000000u | ((level & 0xffu) << 16) | (((level >> 8) & 0xffu) << 8) | 0x51u,
++	};
++	int err = dsi_send(words, 2);
++	static unsigned logged;
++	if (err || logged < 8) {
++		logged++;
++		printf("SWEET DSI: brightness %u -> err %d\n", level, err);
++	}
++	return err;
++}
++
++static void
++dsi_thread(void *arg, wait_result_t result)
++{
++	(void)result;
++	unsigned level = (unsigned)(uintptr_t)arg;
++	unsigned delay_s = 60;
++	(void)PE_parse_boot_argn("sweetbldelay", &delay_s, sizeof(delay_s));
++	uint64_t deadline;
++	clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&d_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++	(void)sweet_dsi_set_brightness(level);
++}
++
++void
++sweet_dsi_init(void)
++{
++	if (!dsi_setup()) {
++		return;
++	}
++	unsigned level = 0;
++	(void)PE_parse_boot_argn("sweetbl", &level, sizeof(level));
++	if (level >= 1 && level <= 0x3ff) {
++		thread_t thread;
++		if (kernel_thread_start(dsi_thread, (void *)(uintptr_t)level, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetBacklight.cpp b/iokit/Kernel/arm/SweetBacklight.cpp
+new file mode 100644
+index 0000000..fa94f98
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -0,0 +1,132 @@
++/*
++ * guacamole backlight service for backboardd. iOS 16.7 backboardd looks for
++ * IOPropertyMatch {backlight-control = true} (and IODeviceTree:/backlight);
++ * neither existed, so brightness requests went nowhere (s0097 log).
++ *
++ * This service publishes backlight-control and an IODisplayParameters
++ * brightness range {min 0, max 1023, value} (the 10-bit DCS range of the
++ * S6E3HC2), and maps setProperties brightness requests to DCS 0x51 through
++ * bsd/dev/sweet_dsi.c. The exact keys backboardd uses on an OLED iPhone are
++ * not known yet: every setProperties call is logged (bounded) so they can
++ * be read from the USB log, and the common forms are applied:
++ *   brightness = N | {value = N}, IODisplayParameters = {brightness = ...},
++ *   DisplayBrightness = N (0..1 float encoded as N/65536 is not handled).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOLib.h>
++#include <string.h>
++#include <IOKit/IOService.h>
++#include <libkern/c++/OSSerialize.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern "C" int sweet_dsi_set_brightness(unsigned level);
++
++class SweetBacklight : public IOService {
++	OSDeclareDefaultStructors(SweetBacklight);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++private:
++	unsigned fLevel;
++	unsigned fLogged;
++	void publishLevel(unsigned level);
++	static bool numberIn(OSObject *o, unsigned *out);
++};
++OSDefineMetaClassAndStructors(SweetBacklight, IOService);
++
++void
++SweetBacklight::publishLevel(unsigned level)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *bright = OSDictionary::withCapacity(3);
++	OSNumber *mn = OSNumber::withNumber(0ULL, 32);
++	OSNumber *mx = OSNumber::withNumber(1023ULL, 32);
++	OSNumber *val = OSNumber::withNumber((unsigned long long)level, 32);
++	if (params && bright && mn && mx && val) {
++		bright->setObject("min", mn);
++		bright->setObject("max", mx);
++		bright->setObject("value", val);
++		params->setObject("brightness", bright);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(mn);
++	OSSafeReleaseNULL(mx);
++	OSSafeReleaseNULL(val);
++	OSSafeReleaseNULL(bright);
++	OSSafeReleaseNULL(params);
++	fLevel = level;
++}
++
++bool
++SweetBacklight::numberIn(OSObject *o, unsigned *out)
++{
++	OSNumber *n = OSDynamicCast(OSNumber, o);
++	if (n) {
++		*out = n->unsigned32BitValue();
++		return true;
++	}
++	OSDictionary *d = OSDynamicCast(OSDictionary, o);
++	if (d && (n = OSDynamicCast(OSNumber, d->getObject("value")))) {
++		*out = n->unsigned32BitValue();
++		return true;
++	}
++	return false;
++}
++
++bool
++SweetBacklight::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLogged = 0;
++	setProperty("backlight-control", true);
++	publishLevel(1023);     /* UEFI leaves the panel at its default level */
++	registerService();
++	IOLog("SWEET BACKLIGHT: registered (backlight-control, 0..1023 -> DCS 0x51)\n");
++	return true;
++}
++
++IOReturn
++SweetBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (fLogged < 24) {
++		fLogged++;
++		OSSerialize *s = OSSerialize::withCapacity(512);
++		if (s && properties->serialize(s)) {
++			const char *text = s->text();
++			IOLog("SWEET BACKLIGHT: setProperties %.400s\n", text ? text : "?");
++		}
++		OSSafeReleaseNULL(s);
++	}
++	if (!dict) {
++		return kIOReturnBadArgument;
++	}
++	unsigned level = 0;
++	bool found = numberIn(dict->getObject("brightness"), &level);
++	OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++	if (!found && params) {
++		found = numberIn(params->getObject("brightness"), &level);
++	}
++	if (!found) {
++		found = numberIn(dict->getObject("DisplayBrightness"), &level);
++	}
++	if (!found) {
++		/* Unknown request: accepted and logged, so clients do not error out. */
++		return kIOReturnSuccess;
++	}
++	if (level > 1023) {
++		level = 1023;
++	}
++	if (level < 1) {
++		level = 1;      /* 0 would blank the panel; display power owns that */
++	}
++	int err = sweet_dsi_set_brightness(level);
++	if (!err) {
++		publishLevel(level);
++	}
++	return err ? kIOReturnNotReady : kIOReturnSuccess;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 index a62416c..2b40e40 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp

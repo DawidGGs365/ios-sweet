@@ -1,34 +1,7 @@
 guacamole GPU: Adreno 640 bring-up stages, RedwoodGPU backend and user client, 64-bit PA pmap sync
 
 Squashed from (in order):
-  0089-guacamole-gpu-stage1-probe
-  0090-guacamole-gpu-stage2-cx-gmu-clocks
-  0091-guacamole-gpu-stage2-order-checkpoints
-  0092-guacamole-gpu-smmu-isv-accessors
-  0093-guacamole-gpu-stage3-gmu-memory-smmu
-  0094-guacamole-gpu-stage4-gmu-boot
-  0095-guacamole-gpu-stage5-hfi
-  0096-guacamole-gpu-stage6-gx-oob
-  0097-guacamole-gpu-stage7-hw-init
-  0098-guacamole-gpu-stage8-cp-start
-  0099-guacamole-gpu-stage9-zap
-  0100-guacamole-gpu-stage9-first-smc-checkpoint
-  0101-guacamole-gpu-zap-no-pas-supported-gate
-  0102-guacamole-gpu-zap-aligned-mem-setup
-  0103-guacamole-gpu-zap-manual-align
-  0104-guacamole-gpu-stage10-ib-fence
-  0105-guacamole-gpu-stage10-tlb-order
-  0106-guacamole-gpu-ib-unpriv-pages
-  0107-guacamole-gpu-fence-event
-  0108-guacamole-gpu-redwood-backend
-  0109-guacamole-gpu-l3-kva
-  0110-guacamole-gpu-backend-slot8
-  0113-guacamole-sweetbox-file
-  0117-guacamole-redwood-gpu-user-client
-  0120-guacamole-pmap-sync-attributes-64bit-pa
-  0122-guacamole-gpu-fence-cache-flush
-  0131-guacamole-zero-copy-surfaces
-  0132-guacamole-wrap-offset-black-off-fb-timing
+  squashed 0082-0091 (= 0144 state)
 
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
 new file mode 100644

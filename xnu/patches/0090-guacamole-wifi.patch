@@ -1,8 +1,7 @@
 guacamole Wi-Fi: /dev/pmem + RPMh for wland, WCN3990 station, en0 + Apple80211 for wifid
 
 Squashed from (in order):
-  0138-guacamole-pmem-rpmh
-  0139-guacamole-en0-apple80211-wifid
+  squashed 0082-0091 (= 0144 state)
 
 diff --git a/bsd/dev/flame_sta.c b/bsd/dev/flame_sta.c
 new file mode 100644

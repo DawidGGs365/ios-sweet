@@ -1,15 +1,8 @@
 guacamole storage: UFS, SWEETBOX mailbox/file drop/root install
 
 Squashed from (in order):
-  0089-guacamole-gpu-stage1-probe
-  0111-guacamole-sweetbox-mailbox
-  0112-guacamole-sweetbox-lock
-  0113-guacamole-sweetbox-file
-  0114-guacamole-sweetbox-part-bootarg
-  0115-guacamole-sweetbox-root-install
-  0116-guacamole-sweetbox-done-marker
-  0118-guacamole-sweetbox-empty-done-marker
-  0119-guacamole-sweetbox-truncate
+  squashed 0082-0091 (= 0144 state)
+  0092-guacamole-alert-slider-and-dsi-brightness (ported from unixnu 0104/0107)
 
 diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
 index 291a546..cccf127 100644
@@ -341,28 +334,30 @@ index 0000000..86832fb
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 6b926fe..278bc5c 100644
+index 6b926fe..5f0c8be 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -53,6 +53,8 @@ extern void sweet_sample_start(void);
+@@ -53,6 +53,9 @@ extern void sweet_sample_start(void);
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
  extern void sweet_usb_probe(void);
 +extern void sweet_gpu_probe(void);
 +extern void sweet_mailbox_probe(void);
++extern void sweet_dsi_init(void);
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -660,6 +662,8 @@ sweet_ufs_init(void)
+@@ -660,6 +663,9 @@ sweet_ufs_init(void)
  	sweet_keys_init();
  	sweet_touch_init();
  	sweet_usb_probe();
 +	sweet_gpu_probe();	/* GUACAMOLE: boot-arg sweetgpu=N */
 +	sweet_mailbox_probe();	/* GUACAMOLE: boot-arg sweetmailbox=1 */
++	sweet_dsi_init();	/* panel brightness over DSI DCS; sweetdsi=0 off */
  	return 0;
  }
  
-@@ -688,6 +692,89 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+@@ -688,6 +694,89 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
  /* Called for all console output, any context: never blocks. */
  void sweet_log_append(const char *c, int size);
  

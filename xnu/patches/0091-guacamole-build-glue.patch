@@ -1,26 +1,21 @@
 guacamole build glue: new sources in bsd/conf/files and iokit/conf/files.arm64, bsd_init hooks
 
 Squashed from (in order):
-  0089-guacamole-gpu-stage1-probe
-  0111-guacamole-sweetbox-mailbox
-  0115-guacamole-sweetbox-root-install
-  0117-guacamole-redwood-gpu-user-client
-  0133-guacamole-pm8150-rtc
-  0137-guacamole-amfi-trust-query
-  0138-guacamole-pmem-rpmh
-  0139-guacamole-en0-apple80211-wifid
+  squashed 0082-0091 (= 0144 state)
+  0092-guacamole-alert-slider-and-dsi-brightness (ported from unixnu 0104/0107)
 
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 6630131..99a2689 100644
+index 6630131..deccf22 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -110,7 +110,16 @@ bsd/dev/sweet_keys.c			standard
+@@ -110,7 +110,17 @@ bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
 +bsd/dev/sweet_pmem.c			standard
  bsd/dev/sweet_usb.c			standard
 +bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_dsi.c			standard
 +bsd/dev/sweet_mailbox.c			standard
 +bsd/dev/sweet_rtc.c			standard
 +bsd/dev/redwood_sta.c		standard
@@ -56,13 +51,14 @@ index bb2a2bf..79817d3 100644
  #if CONFIG_NETBOOT
  	if (netboot) {
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
-index acc9ae0..167418f 100644
+index acc9ae0..2ff7a99 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -16,6 +16,10 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+@@ -16,6 +16,11 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
  iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
  iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
  iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetBacklight.cpp                              optional iokitcpp
 +iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
 +iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
 +iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitcpp

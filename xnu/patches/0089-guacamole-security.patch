@@ -1,10 +1,8 @@
 guacamole security: AMFI dyld policy, cs off, sandbox extensions, trust query
 
 Squashed from (in order):
-  0121-guacamole-amfi-dyld-policy
-  0134-guacamole-amfi-cs-off
-  0135-guacamole-sandbox-extensions
-  0137-guacamole-amfi-trust-query
+  squashed 0082-0091 (= 0144 state)
+  0092-guacamole-alert-slider-and-dsi-brightness (ported from unixnu 0104/0107)
 
 diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
 index cb67b4d..969519f 100644
@@ -272,13 +270,18 @@ index 0000000..9be2ec8
 +}
 +#endif
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
-index 92f3e26..8cca326 100644
+index 92f3e26..8655619 100644
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -82,6 +82,11 @@ const char * gIOKernelConfigTables =
+@@ -82,6 +82,16 @@ const char * gIOKernelConfigTables =
      "     'IOProviderClass' = IOResources;"
      "     'IOMatchCategory' = SweetBattery;"
      "   },"
++    "   {"
++    "     'IOClass'         = SweetBacklight;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetBacklight;"
++    "   },"
 +    "   {"
 +    "     'IOClass'         = AppleMobileFileIntegrity;"
 +    "     'IOProviderClass' = IOResources;"

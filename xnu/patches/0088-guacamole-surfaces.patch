@@ -1,19 +1,7 @@
 guacamole IOSurface: SweetSurface wrap/zero-copy/10-bit, WebKit memory limit
 
 Squashed from (in order):
-  0123-guacamole-sweetsurface-refuse-zero-lock-result
-  0124-guacamole-sweetsurface-10bit-as-bgra
-  0125-guacamole-sweetsurface-wrap-client
-  0126-guacamole-sweetsurface-watch-log
-  0127-guacamole-sweetsurface-watch-bytes
-  0128-guacamole-sweetsurface-watch-user-stack
-  0129-guacamole-sweetsurface-create-at-address
-  0130-guacamole-sweetsurface-wrap-read-only
-  0131-guacamole-zero-copy-surfaces
-  0140-guacamole-webkit-surface-log
-  0141-guacamole-webkit-gpu-keeps-10bit
-  0142-guacamole-webkit-memlimit
-  0143-guacamole-webkit-b3a8-one-plane
+  squashed 0082-0091 (= 0144 state)
 
 diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
 index 1750d3a..c70bf5a 100644
