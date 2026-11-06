@@ -1,0 +1,218 @@
+diff --color -ruN a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c	2026-11-06 12:50:47.486199047 +0100
++++ b/bsd/dev/sweet_rpmh.c	2026-11-06 12:50:47.486806820 +0100
+@@ -12,6 +12,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_bcm_vote(const char *res, uint32_t vote_x, uint32_t vote_y);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -44,6 +45,7 @@
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -159,7 +161,7 @@
+ }
+ 
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup(const char *res, unsigned type, uint32_t *address)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -186,9 +188,9 @@
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if (slave != type || (addr >> 16) != type || (addr & (type == RH_VRM ? 15u : 3u)) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid slave-%u entry for %s (slave %u addr %#x)\n", type, res, slave, addr);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -219,8 +221,15 @@
+ }
+ 
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send(const uint32_t *addrs, const uint32_t *values, unsigned n)
+ {
++	uint32_t address = addrs[0];
++	uint32_t mask = (1u << n) - 1u;
++	/* VRM: one 16-byte resource, 3 offsets; BCM: one 4-byte address. */
++	uint32_t amask = n == 1 ? ~3u : ~15u;
++	if (n < 1 || n > 3) {
++		return EINVAL;
++	}
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+@@ -233,7 +242,7 @@
+ 		}
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
++			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & amask) == (address & amask)) {
+ 				printf("SWEET RPMH: conflicting inherited request for %#x in TCS%u\n", address, t);
+ 				return EBUSY;
+ 			}
+@@ -266,19 +275,16 @@
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	printf("SWEET RPMH: TCS%u ACTIVE %u cmd(s) @%#x first data %#x irq-enable=%#x\n", t, n, address, values[0], irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
++		    !rh_sync(cmd + RH_ADDR, addrs[c]) ||
+ 		    !rh_sync(cmd + RH_DATA, values[c])) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+@@ -289,7 +295,7 @@
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -320,7 +326,7 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: ACTIVE vote @%#x complete\n", address);
+ 	return 0;
+ }
+ 
+@@ -365,10 +371,13 @@
+ 	}
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, RH_VRM, &address);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++		const uint32_t addrs[3] = {address, address + 8, address + 4};
++		const uint32_t values[3] = {mv, 7, 1};
++		error = rh_send(addrs, values, 3);
+ 	}
+ out:
+ 	if (error) {
+@@ -376,5 +385,47 @@
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++/*
++ * guacamole QUP2/GPI: mainline interconnect sm8150 puts qhm_qup2 behind
++ * BCM QUP0 (QUP core clocks) and qnm_aggre2_noc behind BCM SN11, neither
++ * keepalive. Linux (geni-se bus vote, mas 0x99 -> slv 0x200) votes them
++ * before every GSI transfer. One BCM command: commit|valid|x<<14|y.
++ */
++int
++sweet_rpmh_bcm_vote(const char *res, uint32_t vote_x, uint32_t vote_y)
++{
++	static const char *const allowed[] = { "QUP0", "SN11" };
++	bool ok = false;
++	for (unsigned i = 0; res != NULL && i < sizeof(allowed) / sizeof(allowed[0]); i++) {
++		ok |= strcmp(res, allowed[i]) == 0;
++	}
++	if (!ok || vote_x > 0x3fffu || vote_y > 0x3fffu) {
++		printf("SWEET RPMH: BCM %s %u/%u not allowed\n", res ? res : "(null)", vote_x, vote_y);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_BCM, &address);
++	}
++	if (!error) {
++		const uint32_t value = (1u << 30) | (1u << 29) | (vote_x << 14) | vote_y;
++		error = rh_send(&address, &value, 1);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: BCM %s vote failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 12:50:47.486179533 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 12:50:47.486787146 +0100
+@@ -25,6 +25,7 @@
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern int sweet_rpmh_bcm_vote(const char *res, uint32_t vote_x, uint32_t vote_y);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ extern void sweet_hid_touch_panel(int w, int h);
+ void sweet_touch_init(void);
+@@ -597,6 +598,19 @@
+ 		return false;
+ 	}
+ 	gpi.pa = ptoa_64(pn);
++	/*
++	 * 0099: Linux geni-se votes the QUP2 -> DDR bus path before every GSI
++	 * transfer (DT qupv3_2 bus-mas-id 0x99, bus-slv-id 0x200). On SM8150
++	 * that is BCM QUP0 (QUP core clocks) + SN11 (aggre2 NoC); neither is
++	 * keepalive, so without it GPI may run its sequencer but not reach DDR.
++	 */
++	unsigned bcm = 1;
++	(void)PE_parse_boot_argn("sweetgpibcm", &bcm, sizeof(bcm));
++	if (bcm) {
++		int e1 = sweet_rpmh_bcm_vote("QUP0", 1, 1);
++		int e2 = sweet_rpmh_bcm_vote("SN11", 1, 1);
++		touch_log("SWEET TOUCH: GPI bus vote QUP0 err=%d SN11 err=%d\n", e1, e2);
++	}
+ 	if (!gpi_smmu_bypass()) {
+ 		return false;
+ 	}
+@@ -849,6 +863,14 @@
+ 				    c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+ 				touch_log("SWEET TOUCH: GPI ev ctx %x %x %x %x %x %x %x %x\n",
+ 				    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++				/* stock 4.14 gpi_dump_debug_reg(): GPI top debug PC + QSB bus log */
++				touch_log("SWEET TOUCH: GPI dbg pc %#x rf10 %#x rf11 %#x rf12 %#x rf21 %#x\n",
++				    touch_rd(gpi.regs, 0x5048), touch_rd(gpi.regs, 0x5128), touch_rd(gpi.regs, 0x512c),
++				    touch_rd(gpi.regs, 0x5130), touch_rd(gpi.regs, 0x5154));
++				touch_log("SWEET TOUCH: GPI qsb sel %#x err-id %#x log %#x %#x %#x misc %#x %#x %#x %#x\n",
++				    touch_rd(gpi.regs, 0x5050), touch_rd(gpi.regs, 0x5060), touch_rd(gpi.regs, 0x5064), touch_rd(gpi.regs, 0x5068),
++				    touch_rd(gpi.regs, 0x506c), touch_rd(gpi.regs, 0x5070), touch_rd(gpi.regs, 0x5074),
++				    touch_rd(gpi.regs, 0x5078), touch_rd(gpi.regs, 0x507c));
+ 				touch_log("SWEET TOUCH: GPI tx TREs @+%#x %x %x %x %x | %x %x %x %x | %x %x %x %x\n", o,
+ 				    t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11]);
+ 			}
