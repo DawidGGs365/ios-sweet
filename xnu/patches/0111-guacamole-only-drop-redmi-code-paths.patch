@@ -1,0 +1,684 @@
+diff --color -ruN a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c	2026-11-06 14:15:30.446165979 +0100
++++ b/bsd/dev/sweet_keys.c	2026-11-06 14:16:22.650009605 +0100
+@@ -1,9 +1,8 @@
+ /*
+- * Minimal polled SWEET keys. Call once after the scheduler is running.
+- * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+- * guacamole (OnePlus 7 Pro GM1913, stock dtbo project 18821 gpio_keys):
+- * volume-up PM8150 (SID 0) GPIO6, volume-down PM8150 GPIO7, both active
+- * low with pull-up; power is PON KPDPWR as on sweet. The base DT also maps
++ * Polled guacamole keys. Call once after the scheduler is running.
++ * OnePlus 7 Pro GM1913 (stock dtbo project 18821 gpio_keys): volume-up
++ * PM8150 (SID 0) GPIO6, volume-down PM8150 GPIO7, both active low with
++ * pull-up; power is PON KPDPWR. The base DT also maps
+  * PON RESIN to volume-down, so either source counts as volume-down there.
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+@@ -44,15 +43,14 @@
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID;
+-/* Per-board GPIO keys: [0] volume-up, [1] volume-down (guacamole only). */
++/* PMIC GPIO keys: [0] volume-up, [1] volume-down. */
+ static struct {
+ 	uint16_t ppid, base, apid;
+ 	const char *name;
+ } keys_gpio[2] = {
+-	{ 0x4c1, 0xc100, KEYS_NO_APID, "PM6150L GPIO2" },
+-	{ 0, 0, KEYS_NO_APID, NULL },
++	{ 0x0c5, 0xc500, KEYS_NO_APID, "PM8150 GPIO6 vol-up" },   /* SID 0 */
++	{ 0x0c6, 0xc600, KEYS_NO_APID, "PM8150 GPIO7 vol-down" },
+ };
+-static bool keys_guac;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+@@ -144,7 +142,7 @@
+ {
+ 	int mode = 1;
+ 	(void)PE_parse_boot_argn("sweetslider", &mode, sizeof(mode));
+-	if (!keys_guac || mode == 0) {
++	if (mode == 0) {
+ 		return;
+ 	}
+ 	slider_invert = mode == 2;
+@@ -232,7 +230,7 @@
+ 		uint8_t pon = 0, gpio = 0, gdn = 0xff;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 		bool gok = keys_read(keys_gpio[0].apid, keys_gpio[0].base + 0x10u, &gpio);
+-		bool dok = keys_guac && keys_read(keys_gpio[1].apid, keys_gpio[1].base + 0x10u, &gdn);
++		bool dok = keys_read(keys_gpio[1].apid, keys_gpio[1].base + 0x10u, &gdn);
+ 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u) || (dok && !(gdn & 1u))};
+ 		if (!pok || (!gok && keys_gpio[0].apid != KEYS_NO_APID)) {
+ 			if ((errors++ % 250u) == 0) {
+@@ -268,6 +266,10 @@
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
++	if (!sweet_is_guacamole()) {
++		printf("SWEET KEYS: not a guacamole device tree; no keys\n");
++		return;
++	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+ 	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+@@ -283,22 +285,13 @@
+ 		    keys_version, count);
+ 		return;
+ 	}
+-	keys_guac = sweet_is_guacamole();
+-	if (keys_guac) {
+-		keys_gpio[0].ppid = 0x0c5;      /* PM8150 SID 0 GPIO6 */
+-		keys_gpio[0].base = 0xc500;
+-		keys_gpio[0].name = "PM8150 GPIO6 vol-up";
+-		keys_gpio[1].ppid = 0x0c6;      /* PM8150 SID 0 GPIO7 */
+-		keys_gpio[1].base = 0xc600;
+-		keys_gpio[1].name = "PM8150 GPIO7 vol-down";
+-	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+ 	uint8_t pon = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	printf("SWEET KEYS: arb=%#x apids=%u board=%s pon-apid=%u pon=%#x/%d\n",
+-	    keys_version, count, keys_guac ? "guacamole" : "sweet", keys_pon_apid, pon, pok);
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u pon=%#x/%d\n",
++	    keys_version, count, keys_pon_apid, pon, pok);
+ 	bool gok = false;
+-	for (unsigned g = 0; g < (keys_guac ? 2u : 1u); g++) {
++	for (unsigned g = 0; g < 2u; g++) {
+ 		keys_gpio[g].apid = keys_find_apid(keys_gpio[g].ppid, count);
+ 		if (keys_gpio_check(g)) {
+ 			gok = true;
+@@ -310,7 +303,7 @@
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
+ 	slider_init();
+-	if (keys_guac) {
++	{
+ 		/*
+ 		 * Read-only haptics probe: PM8150B (SID 3) qcom,haptics @0xc000 vs the
+ 		 * AW8697 on SE7. TYPE 0x04 / SUBTYPE 0x05 / EN_CTL 0x46 / STATUS1 0x0a.
+diff --color -ruN a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c	2026-11-06 14:15:30.451328500 +0100
++++ b/bsd/dev/sweet_rpmh.c	2026-11-06 14:16:22.650277835 +0100
+@@ -1,5 +1,6 @@
+ /*
+- * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
++ * guacamole RPMh client (apps DRV 2): PMIC5 LDO votes for the touch and USB
++ * PHY rails, BCM bandwidth votes and read-only cmd-db lookups.
+  * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+  * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
+  */
+@@ -342,15 +343,14 @@
+ 	/*
+ 	 * Board-specific helper: do not apply PMIC5-LDO policy to arbitrary
+ 	 * resources. Only these PMIC5 LDOs, at their DT voltages:
+-	 * ldoc11 sweet PM6150L L11C, ldoa17 guacamole PM8150 L17A (touch AVDD);
+-	 * guacamole USB HS PHY (hsphy@88e2000): ldoa5 vdd 0.88 V,
++	 * ldoa17 PM8150 L17A (touch AVDD);
++	 * USB HS PHY (hsphy@88e2000): ldoa5 vdd 0.88 V,
+ 	 * ldoa12 vdda18 1.8 V, ldoa2 vdda33 3.072 V.
+ 	 */
+ 	static const struct {
+ 		const char *res;
+ 		unsigned min, max;
+ 	} allowed[] = {
+-		{ "ldoc11", 2950, 3400 },
+ 		{ "ldoa17", 2950, 3400 },
+ 		{ "ldoa5", 880, 880 },
+ 		{ "ldoa12", 1704, 1800 },
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 14:15:30.441544342 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 14:15:30.467540136 +0100
+@@ -1,9 +1,10 @@
+ /*
+- * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
++ * guacamole (OnePlus 7 Pro) touch: Samsung S6SY761 at I2C 0x48 on QUP SE17.
+  * Call once after the scheduler is running; all work runs on one thread.
+- * Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.
+- * No firmware/config upload or direct PMIC writes. Only IC data write:
+- * zero to GT9896's event status after reading a report. See touch2/report.md.
++ * Two GENI I2C transports: the FIFO engine (SEs with the FIFO interface
++ * enabled; also the template for other QUP I2C devices) and GPI DMA, which
++ * SE17 needs because TrustZone disables its FIFO interface. Rails through
++ * sweet_rpmh.c; no firmware/config upload and no direct PMIC writes.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -32,21 +33,10 @@
+ extern void sweet_hid_touch_panel(int w, int h);
+ void sweet_touch_init(void);
+ 
+-#define TOUCH_SE_PA      0x00a84000u
+ #define TOUCH_GCC_PA     0x00100000u
+-#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
+-#define TOUCH_GCC_VOTE   0x5200cu
+-#define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+ #define TOUCH_MAX        10u
+-#define TOUCH_GOODIX     1
+-#define TOUCH_FTS        2
+-/* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+-#define GOODIX_PID_REG   0x4022u
+-#define GOODIX_EVENT_REG 0x4180u
+-#define GOODIX_HEAD_LEN  8u
+-#define GOODIX_POINT_LEN 8u
+ 
+ #define SE_STATUS       0x040u
+ #define SE_MCLK         0x048u
+@@ -84,7 +74,6 @@
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+ 	bool started, dead, probing;
+-	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+@@ -92,8 +81,7 @@
+ static int touch_sleep_chan;
+ 
+ /*
+- * Board: sweet (SM7150) by default; guacamole (OnePlus 7 Pro, SM8150) when
+- * the ADT root is "oneplus,guacamole". guacamole sources: OOS dtbo 18821
++ * guacamole sources: OOS dtbo 18821
+  * (Samsung_18821@48 on qupv3_se17_i2c), base DTB (SE17 0xc80000), Linux
+  * gcc-sm8150.c / pinctrl-sm8150.c, OnePlus sec_drivers_s6sy761.c.
+  *   QUP SE17 = wrap2 SE3: GCC vote 0x52014 bit 1 s_ahb, bit 2 m_ahb,
+@@ -121,38 +109,22 @@
+ #define S6_CLEAR_STACK   0x62u
+ #define S6_BS_APP        0x20u
+ 
+-static struct {
+-	bool guac;
++/*
++ * SE17 at 0xc80000 is wrapper 2 SE0 (DT clock 0x6d, GPI SE index 0): GCC
++ * vote 0x52014 bits 1 s_ahb, 2 m_ahb, 4 s0; RCG 0x1e148; branches s_ahb
++ * 0x1e004, m_ahb 0x1e008, s0 0x1e144.
++ */
++static const struct {
+ 	uint32_t se_pa, gpio_pa, gpio_size, vote, vote_mask, rcg;
+-	uint32_t branch[5];
++	uint32_t branch[3];
+ 	unsigned nbranch;
+ } hw = {
+-	false, TOUCH_SE_PA, TOUCH_NORTH_PA, 0x5b000, TOUCH_GCC_VOTE,
+-	(0x0fu << 18) | (1u << 23), TOUCH_RCG,
+-	{0x18004, 0x18008, 0x1800c, 0x18010, 0x18144}, 5,
++	GUAC_SE_PA, GUAC_SOUTH_PA, (GUAC_IRQ + 1u) * 0x1000u, 0x52014u,
++	(1u << 1) | (1u << 2) | (1u << 4), 0x1e148u,
++	{0x1e004u, 0x1e008u, 0x1e144u}, 3,
+ };
+ 
+-static void
+-touch_select_board(void)
+-{
+-	if (!sweet_is_guacamole()) {
+-		return;
+-	}
+-	hw.guac = true;
+-	hw.se_pa = GUAC_SE_PA;
+-	hw.gpio_pa = GUAC_SOUTH_PA;
+-	hw.gpio_size = (GUAC_IRQ + 1u) * 0x1000u;
+-	hw.vote = 0x52014u;
+-	/* SE17 at 0xc80000 is wrapper 2 SE0 (DT clock 0x6d, GPI SE index 0): s0 clock, not s3 */
+-	hw.vote_mask = (1u << 1) | (1u << 2) | (1u << 4);
+-	hw.rcg = 0x1e148u;
+-	hw.branch[0] = 0x1e004u;
+-	hw.branch[1] = 0x1e008u;
+-	hw.branch[2] = 0x1e144u;
+-	hw.nbranch = 3;
+-}
+-
+-/* Last SWEET TOUCH line; the guacamole thread re-prints it on stop (GUI hides the console). */
++/* Last SWEET TOUCH line; the thread re-prints it on stop (GUI hides the console). */
+ static char touch_last[224];
+ 
+ static void touch_log(const char *fmt, ...) __printflike(1, 2);
+@@ -1077,54 +1049,12 @@
+ 	return touch_msg(addr, NULL, 0, buf, len, false);
+ }
+ 
+-static int
+-touch_goodix_ack(void)
+-{
+-	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
+-	return touch_msg(0x5d, ack, sizeof(ack), NULL, 0, false);
+-}
+-
+-/* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
+- * not a second accepted GT9896 identity. Never try a four-byte Berlin pointer:
+- * on this 16-bit IC the extra bytes would be register data writes. */
+-static int
+-touch_probe_info(uint16_t reg, uint8_t *buf)
+-{
+-	memset(buf, 0xa5, 32);
+-	int err = touch_read(0x5d, reg, true, buf, 32);
+-	touch_log("SWEET TOUCH: probe info reg=%#x len=32 err=%d irq=%#x seen=%#x\n",
+-	    reg, err, st.irq_last, st.irq_status);
+-	if (!err) {
+-		for (unsigned off = 0; off < 32; off += 16) {
+-			char line[49];
+-			for (unsigned j = 0; j < 16; ++j) {
+-				(void)snprintf(line + j * 3u, 4, "%02x ", buf[off + j]);
+-			}
+-			touch_log("SWEET TOUCH: probe raw %#x: %s\n", reg + off, line);
+-		}
+-	}
+-	return err;
+-}
+-
+ static unsigned
+ touch_be16(const uint8_t *p)
+ {
+ 	return ((unsigned)p[0] << 8) | p[1];
+ }
+ 
+-static bool
+-touch_checksum(const uint8_t *buf, unsigned len)
+-{
+-	if (len < 2) {
+-		return false;
+-	}
+-	unsigned sum = 0;
+-	for (unsigned i = 0; i + 2 < len; ++i) {
+-		sum += buf[i];
+-	}
+-	return (sum & 0xffffu) == touch_be16(buf + len - 2);
+-}
+-
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
+@@ -1143,110 +1073,6 @@
+ 	st.active = mask;
+ }
+ 
+-static int
+-touch_goodix(void)
+-{
+-	uint8_t buf[90];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0;
+-	int err = touch_read(0x5d, GOODIX_EVENT_REG, true, buf, GOODIX_HEAD_LEN);
+-	if (err) {
+-		return err;
+-	}
+-	if (!(buf[0] & 0x80u)) {
+-		/* Do not acknowledge firmware/config requests that we cannot service. */
+-		if (buf[0] & 0x40u) {
+-			return ENOTSUP;
+-		}
+-		return 0; /* no new touch frame: retain current contacts */
+-	}
+-	if (!touch_checksum(buf, GOODIX_HEAD_LEN)) {
+-		return EIO; /* header untrusted: no write to the IC */
+-	}
+-	unsigned n = buf[2] & 15u;
+-	if (n > TOUCH_MAX) {
+-		(void)touch_goodix_ack();
+-		return EIO;
+-	}
+-	if (n) {
+-		err = touch_read(0x5d, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
+-		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
+-		if (err) {
+-			return err;
+-		}
+-		if (!touch_checksum(buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u)) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-	}
+-	for (unsigned i = 0; i < n; ++i) {
+-		const uint8_t *p = buf + GOODIX_HEAD_LEN + i * GOODIX_POINT_LEN;
+-		unsigned id = p[0] >> 4;
+-		unsigned px = touch_be16(p + 2), py = touch_be16(p + 4);
+-		/* Low nibble 1/3 denotes pen data in the vendor parser. */
+-		if ((p[0] & 15u) == 1u || (p[0] & 15u) == 3u || id >= TOUCH_MAX ||
+-		    (mask & (1u << id)) || px > 1079 || py > 2399) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
+-	}
+-	err = touch_goodix_ack();
+-	if (!err) {
+-		touch_report(mask, x, y);
+-	}
+-	return err;
+-}
+-
+-static int
+-touch_focaltech(void)
+-{
+-	uint8_t buf[63];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0, seen = 0;
+-	int err = touch_read(0x38, 0, false, buf, sizeof(buf));
+-	if (err) {
+-		return err;
+-	}
+-	unsigned n = buf[2] & 15u, active = 0;
+-	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
+-		return EIO;
+-	}
+-	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+-		const uint8_t *p = buf + 3u + 6u * i;
+-		unsigned id = p[2] >> 4, event = p[0] >> 6;
+-		if (id >= TOUCH_MAX) {
+-			break; /* vendor's unused-record sentinel */
+-		}
+-		if (seen & (1u << id)) {
+-			return EIO;
+-		}
+-		seen |= 1u << id;
+-		if (event == 1u) {
+-			continue; /* UP record */
+-		}
+-		if (event == 3u) {
+-			return EIO;
+-		}
+-		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+-		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+-		if (px > 1079 || py > 2399) {
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
+-		++active;
+-	}
+-	if (active != n) {
+-		return EIO;
+-	}
+-	touch_report(mask, x, y);
+-	return 0;
+-}
+-
+ static bool
+ touch_se_init(void)
+ {
+@@ -1258,18 +1084,18 @@
+ 	/*
+ 	 * Hard requirements: I2C protocol firmware (proto 3) and the FIFO
+ 	 * interface enabled (GENI_IF_DISABLE_RO 0x64 bit 0 clear, else the SE
+-	 * is GSI-DMA only). FIFO width/depth fields are only checked on
+-	 * sweet; on guacamole an unexpected value is logged and tolerated,
+-	 * since the register layout differs between QUP versions.
++	 * is GSI-DMA only, as SE17 is: then GPI DMA). Unexpected FIFO
++	 * width/depth fields are logged and tolerated, since the register
++	 * layout differs between QUP versions.
+ 	 */
+ 	const uint32_t ifdis = touch_rd(st.se, 0x64);
+-	if (hw.guac && ((fw >> 8) & 0xffu) == 3u && (ifdis & 1u)) {
++	if (((fw >> 8) & 0xffu) == 3u && (ifdis & 1u)) {
+ 		touch_log("SWEET TOUCH: SE17 FIFO interface disabled (fw=%#x ifdis=%#x): using GPI DMA\n", fw, ifdis);
+ 		return gpi_init();
+ 	}
+ 	const bool fifo_ok = ((tx >> 24) & 0x3fu) == 32u && ((rx >> 24) & 0x3fu) == 32u &&
+ 	    ((tx >> 16) & 0x3fu) >= 2u && ((rx >> 16) & 0x3fu) >= 2u;
+-	if (((fw >> 8) & 0xffu) != 3u || (ifdis & 1u) || (!fifo_ok && !hw.guac)) {
++	if (((fw >> 8) & 0xffu) != 3u) {
+ 		touch_log("SWEET TOUCH: SE bad fw=%#x ifdis=%#x tx=%#x rx=%#x st=%#x\n",
+ 		    fw, ifdis, tx, rx, touch_rd(st.se, SE_STATUS));
+ 		return false;
+@@ -1278,7 +1104,7 @@
+ 		touch_log("SWEET TOUCH: unexpected FIFO params tx=%#x rx=%#x; continuing\n", tx, rx);
+ 	}
+ 	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+-		touch_log("SWEET TOUCH: SE7 already busy; probes skipped\n");
++		touch_log("SWEET TOUCH: SE already busy; probes skipped\n");
+ 		return false;
+ 	}
+ 	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+@@ -1481,9 +1307,11 @@
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	touch_log("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+-	touch_select_board();
+-	touch_log("SWEET TOUCH: %s: mapping GCC/TLMM %#x/SE %#x\n", hw.guac ? "guacamole" : "sweet",
+-	    hw.gpio_pa, hw.se_pa);
++	if (!sweet_is_guacamole()) {
++		touch_log("SWEET TOUCH: not a guacamole device tree; stopping\n");
++		goto out;
++	}
++	touch_log("SWEET TOUCH: mapping GCC/TLMM %#x/SE %#x\n", hw.gpio_pa, hw.se_pa);
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+ 	st.gpio = ml_io_map(hw.gpio_pa, hw.gpio_size);
+ 	st.se = ml_io_map(hw.se_pa, 0x4000);
+@@ -1491,76 +1319,11 @@
+ 		touch_log("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+-	if (!touch_clocks() || !touch_se_init()) {
+-		goto out;
+-	}
+-	if (hw.guac) {
++	if (touch_clocks() && touch_se_init()) {
+ 		touch_guacamole();
+-		goto out;
+-	}
+-	touch_log("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+-	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+-	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	int power_error = sweet_rpmh_vreg_enable("ldoc11", 3200);
+-	if (power_error) {
+-		touch_log("SWEET TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
+-		goto out;
+-	}
+-	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
+-	touch_wait(10); /* conservative rail settling; not a DT timing value */
+-	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+-	touch_gpio(7, 1, 0, 0, false, false);
+-	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	touch_wait(2);
+-	touch_gpio(8, 0, 3, 3, true, true);
+-	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
+-	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
+-	st.probing = true;
+-	int ge = touch_probe_info(GOODIX_PID_REG, gid);
+-	touch_log("SWEET TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+-	    ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11], st.irq_status);
+-	(void)touch_probe_info(0x8240, legacy);
+-	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
+-	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
+-	touch_log("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+-	    fe1, fe2, fid1, fid2, st.irq_status);
+-	st.probing = false;
+-	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '9' && gid[3] == '6';
+-	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
+-	if (st.dead || goodix == fts) {
+-		touch_log("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
+-		    goodix, fts, st.dead);
+-		goto out;
+-	}
+-	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+-	touch_log("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+-	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
+-	unsigned errors = 0, ticks = 0;
+-	while (!st.dead) {
+-		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
+-		    (++ticks % 10u) == 0) {
+-			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
+-			if (err) {
+-				if ((errors++ % 100u) == 0) {
+-					touch_log("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+-				}
+-				if (errors == 10) {
+-					touch_report(0, st.x, st.y); /* release after persistent bad reads */
+-				}
+-			} else {
+-				errors = 0;
+-			}
+-		}
+-		touch_wait(10);
+ 	}
+-	touch_report(0, st.x, st.y);
+ out:
+-	if (hw.guac) {
++	{
+ 		char last[sizeof(touch_last)];
+ 		strlcpy(last, touch_last, sizeof(last));
+ 		for (unsigned i = 0; i < 120; ++i) {
+@@ -1582,7 +1345,6 @@
+ 	}
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+-	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	if (!enabled) {
+ 		touch_log("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+diff --color -ruN a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c	2026-11-06 14:15:30.448979600 +0100
++++ b/bsd/dev/sweet_usb.c	2026-11-06 14:16:40.800352587 +0100
+@@ -1,14 +1,12 @@
+ /*
+- * SWEET: USB bring-up, step 1 - read-only state probe.
+- *
+- * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+- * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
+- * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
+- * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). ABL uses this
+- * controller for fastboot; this probe only reports what state it is left
+- * in after `fastboot boot`. It never writes a register, and it touches the
+- * DWC3 / PHY register blocks only when the GCC status registers say their
+- * power domain and clocks are on (an access to a gated block would hang).
++ * guacamole USB: Synopsys DWC3 at 0x0a600000 behind Qualcomm's
++ * dwc-usb3-msm wrapper, used high-speed only, with the SNPS femto HS PHY at
++ * 0x088e2000. Power domain USB30_PRIM GDSC, clocks from GCC (gcc-sm8150.c).
++ * sweetusb=1 only reports the state ABL leaves after `fastboot boot`;
++ * sweetusb=2 powers the controller and PHY up (usb_guac_power_up) and runs
++ * device mode with the CDC-ECM live log. DWC3 / PHY registers are touched
++ * only when the GCC status registers say their power domain and clocks are
++ * on (an access to a gated block would hang).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -107,45 +105,18 @@
+ 	{ "master", 0x0f010 },
+ 	{ "sleep", 0x0f014 },
+ 	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
++	{ "cfg-noc-axi", 0x0f078 },
++	{ "aggre-axi", 0x0f07c },
+ 	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "clkref", 0x8c008 },
+ };
+-
+ /*
+- * The table above is SM7150 (sweet, gcc-sm7150.c). SM8150 (guacamole,
+- * gcc-sm8150.c) has the same GDSC, master/sleep/utmi and ahb2phy, but
+- * cfg-noc-axi 0xf078, aggre-axi 0xf07c and clkref 0x8c008. cfg-noc-axi
+- * gates the DWC3 reads, so a wrong offset either skips USB or reads an
+- * unclocked block (bus hang). DWC3, QSCRATCH and the HS PHY share their
+- * addresses on both SoCs.
++ * SM8150 (gcc-sm8150.c) offsets. cfg-noc-axi gates the DWC3 reads, so a
++ * wrong offset either skips USB or reads an unclocked block (bus hang).
+  */
+-static bool usb_guac;
+-
+-static void
+-usb_soc_select(void)
+-{
+-	if (!sweet_is_guacamole()) {
+-		return;
+-	}
+-	usb_guac = true;
+-	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		if (strcmp(usb_cbcr[i].name, "cfg-noc-axi") == 0) {
+-			usb_cbcr[i].off = 0x0f078;
+-		} else if (strcmp(usb_cbcr[i].name, "aggre-axi") == 0) {
+-			usb_cbcr[i].off = 0x0f07c;
+-		} else if (strcmp(usb_cbcr[i].name, "clkref") == 0) {
+-			usb_cbcr[i].off = 0x8c008;
+-		}
+-	}
+-	printf("SWEET USB: SM8150 (guacamole) GCC clock offsets\n");
+-}
+ 
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -379,14 +350,17 @@
+ 	if (!enabled) {
+ 		return;
+ 	}
+-	usb_soc_select();
++	if (!sweet_is_guacamole()) {
++		printf("SWEET USB: not a guacamole device tree; USB left alone\n");
++		return;
++	}
+ 	/*
+ 	 * The 5 s recap was for reading the log from screen photos; with the
+ 	 * live USB log it only repeats lines. sweetusbrecap=1 brings it back.
+ 	 */
+ 	int recap_on = 0;
+ 	(void)PE_parse_boot_argn("sweetusbrecap", &recap_on, sizeof(recap_on));
+-	if (usb_guac && enabled >= 2 && recap_on) {
++	if (enabled >= 2 && recap_on) {
+ 		thread_t recap;
+ 		if (kernel_thread_start(usb_recap_thread, NULL, &recap) == KERN_SUCCESS) {
+ 			thread_deallocate(recap);
+@@ -397,7 +371,7 @@
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
+-	if (usb_guac && enabled >= 2) {
++	if (enabled >= 2) {
+ 		printf("SWEET USB: as found: GDSC 0x%08x master 0x%08x cfg-noc 0x%08x\n",
+ 		    usb_rd(gcc, GCC_USB30_PRIM_GDSCR), usb_rd(gcc, 0x0f010), usb_rd(gcc, 0x0f078));
+ 		usb_guac_power_up(gcc);
+@@ -431,22 +405,6 @@
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+-	if (usb_guac) {
+-		return; /* SNPS femto PHY, not QUSB2: the QUSB2 offsets below do not exist */
+-	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
+-	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+ }
+ 
+ /*
+diff --color -ruN a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-06 14:15:30.453679558 +0100
++++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-06 14:16:22.650306664 +0100
+@@ -1,8 +1,10 @@
+ /*
+  * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+- * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+- * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+- * See report.md for binary evidence, register provenance and integration.
++ * sweetbattery=1 (not used on guacamole): read-only SMB5 charger / BMS
++ * polling at SPMI SID 0, written for the Redmi's PM6150; voltage-derived
++ * SOC is an UNCALIBRATED estimate. Kept as the starting point for charger
++ * status on guacamole, whose PM8150B (SID 2) carries the same SMB5 charger
++ * block; the SID and offsets must be checked against the stock DT first.
+  * guacamole: the bq27541 fuel gauge (bsd/dev/sweet_gfg.c) supplies real SOC,
+  * voltage, current, temperature, capacities and cycle count, polled every
+  * 30 s by default (sweetgfg=0 disables it).

@@ -1,6 +1,6 @@
 # ios-sweet on the Redmi Note 10 Pro (upstream README)
 
-> This is the original README of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet), kept for the `sweet` target. The fork's own README covers the OnePlus 7 Pro port.
+> This is the original README of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet), kept for reference. This fork targets the OnePlus 7 Pro only: since patch 0111 its drivers no longer support the Redmi Note 10 Pro. The fork's own README covers the OnePlus 7 Pro port.
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**
 

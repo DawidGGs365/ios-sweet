@@ -2,7 +2,7 @@
 
 **Apple's iOS 16.7.16 userland on a OnePlus 7 Pro (`guacamole`, GM1913, Snapdragon 855 / SM8150).**
 
-This fork carries the XNU kernel side of the OnePlus 7 Pro port. It started from [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet), which ports Apple's open-source XNU (xnu-8796, the iOS 16 generation) to the Redmi Note 10 Pro (`sweet`, SM7150). The same `SWEET` kernel configuration now runs on both phones. Drivers pick the board at runtime from the device tree (`sweet_is_guacamole()`), so the upstream `sweet` support still builds. Its instructions are in [`docs/SWEET.md`](docs/SWEET.md).
+This fork carries the XNU kernel side of the OnePlus 7 Pro port. It started from [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet), which ports Apple's open-source XNU (xnu-8796, the iOS 16 generation) to the Redmi Note 10 Pro (`sweet`, SM7150). The kernel configuration keeps its upstream name `SWEET`, but this fork targets guacamole only. Since 0111 the device drivers carry no Redmi code paths, and they refuse to start on any other device tree (`sweet_is_guacamole()`). The upstream Redmi README is kept for reference as [`docs/SWEET.md`](docs/SWEET.md).
 
 The boot chain, payload and board files for guacamole live in the companion repository **unixnu-guacamole**: Project Aloha UEFI → UniXNU → DarwinBoot → this kernel.
 
@@ -54,6 +54,7 @@ Driver lines start with `SWEET <DRIVER>:` (TOUCH, GPU, KEYS, SLIDER, DSI, BACKLI
 | Boot-arg | Effect |
 | --- | --- |
 | `sweettouch=0/1`, `sweettouchdelay=S` | Touch driver off/on; start S seconds after boot |
+| `sweetgpistop=1/2` | Touch GPI: ring no DMA doorbell / only the first one |
 | `sweetgpibcm=0` | Skip the QUP0/SN11 bus votes before GPI init |
 | `sweetgpu=N`, `sweetgpudelay=S` | GPU: 1 read state, 2 power CX, 3 boot the GMU and do the HFI handshake, 4 also send the perf/BW tables and CORE_FW_START |
 | `sweetbl=N`, `sweetbldelay=S` | Set brightness N (1..1023) once, S seconds after boot (path test without the GUI) |
@@ -80,7 +81,9 @@ Driver lines start with `SWEET <DRIVER>:` (TOUCH, GPU, KEYS, SLIDER, DSI, BACKLI
 | 0103 | bq27541 fuel gauge |
 | 0104 | Brightness: DSI DCS 0x51 and the `backlight-control` service |
 | 0107 | Alert slider as the ring/silent switch; read-only haptics probe |
-| 0109 | One cached board check for all drivers; panel stretch without read-back |
+| 0109 | One cached board check for all drivers; panel stretch without read-back; `SWEET SYS` CPU/RAM line |
+| 0110 | GPI: SMMU fault state around every doorbell, `sweetgpistop` |
+| 0111 | guacamole only: Redmi touch ICs (GT9896, Focaltech), SM7150 USB offsets and QUSB2 dump, PM6150L keys and the L11C rail removed. The generic GENI FIFO I²C engine and the SMB5 charger reader stay as templates |
 
 ## guacamole hardware facts
 
