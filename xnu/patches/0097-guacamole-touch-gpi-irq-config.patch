@@ -1,0 +1,79 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 08:56:29.145203488 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 08:56:29.172594695 +0100
+@@ -583,11 +583,27 @@
+ 		(void)gpi_cmd(GPI_EV_CMD, GPI_CMD_RESET, 0, GPI_EV_CNTXT, 1u);
+ 		(void)gpi_cmd(GPI_EV_CMD, GPI_CMD_DEALLOC, 0, 0, 0xffu);
+ 	}
+-	/* Interrupts stay masked: completion is polled from the event ring. */
+-	touch_wr(gpi.regs, GPI_GPII_REG(0x23088u), 0);         /* CNTXT_TYPE_IRQ_MSK */
++	/*
++	 * Linux gpi_config_interrupts(DEFAULT_IRQ_SETTINGS), before the event
++	 * ring is allocated. INTSET=1 selects wired IRQ delivery instead of MSI:
++	 * without it (s0096) the first transfer stopped with error log 0x4006010
++	 * (global error, code 6). Completion is still polled; the GIC line is
++	 * not enabled in this kernel.
++	 */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23088u), 0x4fu);     /* TYPE_IRQ_MSK: GENERAL IEOB GLOB EV_CTRL CH_CTRL */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x230b8u), 1);         /* SRC_IEOB_IRQ_MSK */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23098u), 3);         /* SRC_CH_IRQ_MSK */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x2309cu), 1);         /* SRC_EV_CH_IRQ_MSK */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23108u), 0xfu);      /* GLOB_IRQ_EN */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23120u), 0xfu);      /* GPII_IRQ_EN */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23188u), 0);         /* MSI_BASE_LSB/MSB */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x2318cu), 0);
+ 	touch_wr(gpi.regs, GPI_GPII_REG(0x23400u), 0);         /* SCRATCH_0/1 */
+ 	touch_wr(gpi.regs, GPI_GPII_REG(0x23404u), 0);
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23180u), 1);         /* INTSET: IRQ */
+ 	touch_wr(gpi.regs, GPI_ERROR_LOG, 0);
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23110u), 0xffffffffu); /* GLOB_IRQ_CLR */
++	touch_wr(gpi.regs, GPI_GPII_REG(0x23128u), 0xffffffffu); /* GPII_IRQ_CLR */
+ 
+ 	/* Event ring (gpi_alloc_ev_chan) */
+ 	uint64_t ev = gpi.pa + GB_EV;
+@@ -691,8 +707,8 @@
+ 	memcpy((void *)(gpi.va + GB_TXBUF), tx, nt);
+ 	gpi_sync(GB_TXBUF, 64);
+ 	gpi_queue(0, GPI_I2C_CONFIG0, 0, 2u, TRE_CONFIG0 | TRE_CHAIN);
+-	gpi_queue(0, GPI_I2C_WRITE | ((uint32_t)addr << 8) | (stretch ? (1u << 26) : 0u), 0, nt,
+-	    TRE_GO | TRE_CHAIN);
++	gpi_queue(0, GPI_I2C_WRITE | ((uint32_t)addr << 8) | (stretch ? (1u << 26) : 0u), 0, 0,
++	    TRE_GO | TRE_CHAIN);    /* downstream i2c-qcom-geni: write GO rx_len 0 */
+ 	gpi_queue(0, (uint32_t)(gpi.pa + GB_TXBUF), (uint32_t)((gpi.pa + GB_TXBUF) >> 32), nt, TRE_DMA | TRE_IEOT);
+ 	gpi_ring(0);
+ 	return gpi_wait(0);
+@@ -703,7 +719,7 @@
+ {
+ 	gpi_sync(GB_RXBUF, (nr + 63u) & ~63u);
+ 	gpi_queue(1, (uint32_t)(gpi.pa + GB_RXBUF), (uint32_t)((gpi.pa + GB_RXBUF) >> 32), nr, TRE_DMA | TRE_IEOT);
+-	gpi_queue(0, GPI_I2C_READ | ((uint32_t)addr << 8), 0, nr, TRE_GO | TRE_LINK);
++	gpi_queue(0, GPI_I2C_READ | ((uint32_t)addr << 8), 0, nr, TRE_GO | TRE_LINK | (1u << 8)); /* + IEOB */
+ 	gpi_ring(1);
+ 	gpi_ring(0);
+ 	int err = gpi_wait(1);
+@@ -752,11 +768,22 @@
+ 	}
+ 	if (err) {
+ 		if (st.probing) {
+-			touch_log("SWEET TOUCH: GPI xfer addr=%#x err=%d ev %08x %08x %08x %08x err-log %#x ch %#x/%#x\n",
++			uint32_t ring = (uint32_t)(gpi.pa + GB_TX);
++			touch_log("SWEET TOUCH: GPI xfer addr=%#x err=%d ev %08x %08x %08x %08x err-log %#x ch %#x/%#x "
++			    "tx-rp +%#x irq type %#x glob %#x gpii %#x ch %#x ev-rp +%#x\n",
+ 			    addr, err, gpi.last_ev[0], gpi.last_ev[1], gpi.last_ev[2], gpi.last_ev[3],
+ 			    touch_rd(gpi.regs, GPI_ERROR_LOG), touch_rd(gpi.regs, GPI_CH_CNTXT(0)),
+-			    touch_rd(gpi.regs, GPI_CH_CNTXT(1)));
+-		}
++			    touch_rd(gpi.regs, GPI_CH_CNTXT(1)), touch_rd(gpi.regs, GPI_CH_CNTXT(0) + 0x10) - ring,
++			    touch_rd(gpi.regs, GPI_GPII_REG(0x23080u)), touch_rd(gpi.regs, GPI_GPII_REG(0x23100u)),
++			    touch_rd(gpi.regs, GPI_GPII_REG(0x23118u)), touch_rd(gpi.regs, GPI_GPII_REG(0x23090u)),
++			    touch_rd(gpi.regs, GPI_EV_CNTXT + 0x10) - (uint32_t)(gpi.pa + GB_EV));
++		}
++		touch_wr(gpi.regs, GPI_ERROR_LOG, 0);
++		touch_wr(gpi.regs, GPI_GPII_REG(0x23110u), 0xffffffffu);
++		touch_wr(gpi.regs, GPI_GPII_REG(0x23128u), 0xffffffffu);
++		touch_wr(gpi.regs, GPI_GPII_REG(0x230a0u), 0xffffffffu); /* SRC_CH_IRQ_CLR */
++		touch_wr(gpi.regs, GPI_GPII_REG(0x230a4u), 0xffffffffu); /* SRC_EV_CH_IRQ_CLR */
++		touch_wr(gpi.regs, GPI_GPII_REG(0x230c0u), 0xffffffffu); /* SRC_IEOB_IRQ_CLR */
+ 		if (!gpi_restart()) {
+ 			st.dead = true;
+ 		}
