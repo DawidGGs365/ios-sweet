@@ -155,16 +155,23 @@ diff --color -ruN a/bsd/dev/sweet_gfg.c b/bsd/dev/sweet_gfg.c
  	if (g_dead) {
 diff --color -ruN a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
 --- a/bsd/dev/sweet_keys.c	2026-11-06 13:58:37.683493100 +0100
-+++ b/bsd/dev/sweet_keys.c	2026-11-06 13:58:37.710981705 +0100
-@@ -26,6 +26,7 @@
++++ b/bsd/dev/sweet_keys.c	2026-11-06 14:06:03.493678330 +0100
+@@ -25,10 +25,14 @@
+ #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
  #include <pexpert/device_tree.h>
++#include <mach/machine.h>
  
 +extern bool sweet_is_guacamole(void);        /* bsd/dev/sweet_board.c */
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern void sweet_hid_key(int key, int down);
  extern bool sweet_hid_ringer(int ring);
-@@ -104,30 +105,6 @@
++extern uint32_t processor_avail_count;          /* osfmk/kern/processor.c */
++extern uint64_t max_mem;                        /* osfmk/mach/vm_param.h */
+ extern unsigned sweet_hid_button_clients(void);
+ void sweet_keys_init(void);
+ 
+@@ -104,30 +108,6 @@
  	return false;
  }
  
@@ -195,7 +202,7 @@ diff --color -ruN a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
  /* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
  static bool
  keys_gpio_check(unsigned g)
-@@ -147,7 +124,6 @@
+@@ -147,7 +127,6 @@
  	return ok;
  }
  
@@ -203,7 +210,23 @@ diff --color -ruN a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
  /* Alert slider: TLMM tile + 0x1000 * gpio; CTL at +0, IN_OUT at +4. */
  static struct {
  	uint32_t pa;
-@@ -298,7 +274,7 @@
+@@ -222,9 +201,15 @@
+ 	int sl_seen = -1, sl_stable = 0, sl_sent = -1;
+ 	unsigned sl_clients = 0;
+ 	static const char *const sl_names[] = { "ring", "vibrate", "silent" };
++	unsigned polls = 0;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
++		/* Early boot lines miss the USB log: report CPUs/RAM once at ~30 s. */
++		if (++polls == 1500) {
++			printf("SWEET SYS: %u of %d cpus running, max_mem %llu MiB\n",
++			    processor_avail_count, machine_info.max_cpus, (unsigned long long)(max_mem >> 20));
++		}
+ 		if (slider_ok) {
+ 			int pos = slider_read();
+ 			sl_stable = pos == sl_seen ? sl_stable + 1 : 0;
+@@ -298,7 +283,7 @@
  		    keys_version, count);
  		return;
  	}
