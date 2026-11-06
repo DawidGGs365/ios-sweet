@@ -1,0 +1,32 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-06 07:25:08.909345681 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-06 07:25:29.454436154 +0100
+@@ -622,12 +622,24 @@
+ 	touch_log("SWEET TOUCH: se@%#x fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+ 	    hw.se_pa, fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, 0x908));
+-	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+-	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+-	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		touch_log("SWEET TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
++	/*
++	 * Hard requirements: I2C protocol firmware (proto 3) and the FIFO
++	 * interface enabled (GENI_IF_DISABLE_RO 0x64 bit 0 clear, else the SE
++	 * is GSI-DMA only). FIFO width/depth fields are only checked on
++	 * sweet; on guacamole an unexpected value is logged and tolerated,
++	 * since the register layout differs between QUP versions.
++	 */
++	const uint32_t ifdis = touch_rd(st.se, 0x64);
++	const bool fifo_ok = ((tx >> 24) & 0x3fu) == 32u && ((rx >> 24) & 0x3fu) == 32u &&
++	    ((tx >> 16) & 0x3fu) >= 2u && ((rx >> 16) & 0x3fu) >= 2u;
++	if (((fw >> 8) & 0xffu) != 3u || (ifdis & 1u) || (!fifo_ok && !hw.guac)) {
++		touch_log("SWEET TOUCH: SE bad fw=%#x ifdis=%#x tx=%#x rx=%#x st=%#x\n",
++		    fw, ifdis, tx, rx, touch_rd(st.se, SE_STATUS));
+ 		return false;
+ 	}
++	if (!fifo_ok) {
++		touch_log("SWEET TOUCH: unexpected FIFO params tx=%#x rx=%#x; continuing\n", tx, rx);
++	}
+ 	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+ 		touch_log("SWEET TOUCH: SE7 already busy; probes skipped\n");
+ 		return false;
