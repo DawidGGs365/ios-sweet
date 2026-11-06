@@ -220,8 +220,8 @@ diff --color -ruN a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
  	for (;;) {
 +		/* Early boot lines miss the USB log: report CPUs/RAM once at ~30 s. */
 +		if (++polls == 1500) {
-+			printf("SWEET SYS: %u of %d cpus running, max_mem %llu MiB\n",
-+			    processor_avail_count, machine_info.max_cpus, (unsigned long long)(max_mem >> 20));
++			printf("SWEET SYS: %u of %u cpus running, max_mem %llu MiB\n",
++			    processor_avail_count, ml_get_max_cpus(), (unsigned long long)(max_mem >> 20));
 +		}
  		if (slider_ok) {
  			int pos = slider_read();
