@@ -77,7 +77,16 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        # blacktop's script skips a patch that does not apply and keeps going;
+        # for our own numbered patches that is a silent wrong kernel (s0114
+        # ran without 0114). Fail the build if any of them was skipped.
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
+          if grep -E "Skipping patch [^ ]*/[0-9]{4}-[^ ]*\.patch" build.log; then
+            echo "::error::one of our xnu/patches was skipped (does not apply)"
+            exit 1
+          fi
 
       - name: Package build tree for local compiles
         if: always()
