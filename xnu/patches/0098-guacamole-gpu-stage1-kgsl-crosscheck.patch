@@ -1,0 +1,118 @@
+diff --color -ruN a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c	2026-11-06 08:57:09.591799541 +0100
++++ b/bsd/dev/sweet_gpu.c	2026-11-06 08:58:02.271635091 +0100
+@@ -268,13 +268,19 @@
+ 	return false;
+ }
+ 
+-/* 4 KiB stage-1 page: AF, inner shareable, EL0+EL1 RW, nG, MAIR index 0 (normal non-cacheable). */
++/*
++ * 4 KiB stage-1 page: AF, inner shareable, nG, MAIR index 0 (normal
++ * non-cacheable). KGSL maps the GMU code/data/log with IOMMU_PRIV (EL1-only
++ * RW); an EL0-writable page would also be privileged-execute-never, which
++ * would stop the GMU running from its icache. Only HFI is unprivileged.
++ */
+ static void
+-gm_map(uint32_t gva, uint32_t off, uint32_t size)
++gm_map(uint32_t gva, uint32_t off, uint32_t size, bool unpriv)
+ {
+ 	uint64_t *l3 = (uint64_t *)(gm_va + (gva < 0x40000000u ? GM_L3A : GM_L3B));
+ 	for (uint32_t o = 0; o < size; o += 0x1000u) {
+-		l3[((gva + o) >> 12) & 0x1ffu] = (gm_pa + off + o) | 3u | (1u << 10) | (3u << 8) | (1u << 6) | (1u << 11);
++		l3[((gva + o) >> 12) & 0x1ffu] = (gm_pa + off + o) | 3u | (1u << 10) | (3u << 8) |
++		    (unpriv ? (1u << 6) : 0u) | (1u << 11);
+ 	}
+ }
+ 
+@@ -296,11 +302,11 @@
+ 	l1[GVA_DUMMY >> 30] = (gm_pa + GM_L2B) | 3u;            /* 0x40000000-0x7fffffff */
+ 	l2a[0] = (gm_pa + GM_L3A) | 3u;
+ 	l2b[(GVA_DUMMY >> 21) & 0x1ffu] = (gm_pa + GM_L3B) | 3u;
+-	gm_map(GVA_ICACHE, GM_ICACHE, GVA_CACHE_SIZE);
+-	gm_map(GVA_DCACHE, GM_DCACHE, GVA_CACHE_SIZE);
+-	gm_map(GVA_DUMMY, GM_DUMMY, 0x1000u);
+-	gm_map(GVA_HFI, GM_HFI, GVA_BUF_SIZE);
+-	gm_map(GVA_LOG, GM_LOG, GVA_BUF_SIZE);
++	gm_map(GVA_ICACHE, GM_ICACHE, GVA_CACHE_SIZE, false);
++	gm_map(GVA_DCACHE, GM_DCACHE, GVA_CACHE_SIZE, false);
++	gm_map(GVA_DUMMY, GM_DUMMY, 0x1000u, false);
++	gm_map(GVA_HFI, GM_HFI, GVA_BUF_SIZE, true);
++	gm_map(GVA_LOG, GM_LOG, GVA_BUF_SIZE, false);
+ 	return true;
+ }
+ 
+@@ -414,9 +420,18 @@
+ 	gpu_wr(gm_smmu, 0x68, 0);                                      /* TLBIALLNSNH */
+ 	gpu_wr(gm_smmu, 0x70, 0);                                      /* TLBGSYNC */
+ 	(void)gpu_poll(gm_smmu, 0x74, 1u, 0, 10);
+-	printf("SWEET GPU: S1 SMMU smr%d -> cb%d ttbr 0x%llx sCR0 0x%08x->0x%08x sctlr 0x%08x\n",
+-	    smr_idx, gm_smmu_cb, gm_pa + GM_L1, scr0, gpu_rd(gm_smmu, 0x0), gpu_rd(gm_cb, 0x0));
+-	return true;
++	uint32_t s2cr = gpu_rd(gm_smmu, 0xc00 + 4 * (uint32_t)smr_idx);
++	uint32_t smr = gpu_rd(gm_smmu, 0x800 + 4 * (uint32_t)smr_idx);
++	bool ok = ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == n &&
++	    smr == ((1u << 31) | (0x400u << 16) | 5u) && (gpu_rd(gm_cb, 0x0) & 1u) && !(gpu_rd(gm_smmu, 0x0) & 1u);
++	printf("SWEET GPU: S1 SMMU smr%d %#x s2cr %#x -> cb%d ttbr 0x%llx sCR0 0x%08x->0x%08x sctlr 0x%08x: %s\n",
++	    smr_idx, smr, s2cr, gm_smmu_cb, gm_pa + GM_L1, scr0, gpu_rd(gm_smmu, 0x0), gpu_rd(gm_cb, 0x0),
++	    ok ? "ok" : "REJECTED, GMU not started");
++	if (!ok) {
++		gpu_wr(gm_smmu, 0x800 + 4 * (uint32_t)smr_idx, 0);
++		gm_cb = 0;
++	}
++	return ok;
+ }
+ 
+ static void
+@@ -474,12 +489,11 @@
+ 	}
+ 	gpu_wr(pdc, PDC(PDC_SEQ_START), 0);
+ 	gpu_wr(pdc, PDC(PDC_ENABLE), 0x80000001u);
+-	/* a6xx_rpmh_stop */
+-	gpu_wr(g_gmu, GMU_RSCC_CONTROL_REQ, 1);
+-	bool ok = gpu_poll(g_gmu, RSCC(0x004), 1u << 16, 1u << 16, 10);
+-	gpu_wr(g_gmu, GMU_RSCC_CONTROL_REQ, 0);
+-	printf("SWEET GPU: S1 RSC/PDC programmed, RSC power-off %s (status 0x%08x)\n", ok ? "ok" : "TIMEOUT",
+-	    gpu_rd(g_gmu, RSCC(0x004)));
++	/*
++	 * KGSL (_load_gmu_rpmh_ucode on the first cold boot) stops here: no RSC
++	 * sleep/wake cycle until the GPU has been through a sleep sequence.
++	 */
++	printf("SWEET GPU: S1 RSC/PDC programmed (status 0x%08x)\n", gpu_rd(g_gmu, RSCC(0x004)));
+ 	return true;
+ }
+ 
+@@ -564,23 +578,17 @@
+ 	}
+ 	/* a6xx_gmu_fw_start, cold boot */
+ 	gpu_wr(g_gmu, GMU_GENERAL_7, 1);                        /* TCM retention */
+-	gpu_wr(g_gmu, GMU_RSCC_CONTROL_REQ, 1u << 1);           /* a6xx_rpmh_start */
+-	bool rsc = gpu_poll(g_gmu, GMU_RSCC_CONTROL_ACK, 1u << 1, 1u << 1, 10) &&
+-	    gpu_poll(g_gmu, RSCC(0x101), 0xffffffffu, 0, 10);
+-	gpu_wr(g_gmu, GMU_RSCC_CONTROL_REQ, 0);
+-	printf("SWEET GPU: S1 RSC wake %s (ack 0x%08x seq-busy 0x%08x)\n", rsc ? "ok" : "TIMEOUT",
+-	    gpu_rd(g_gmu, GMU_RSCC_CONTROL_ACK), gpu_rd(g_gmu, RSCC(0x101)));
+-	if (!rsc || !gm_fw_load(fw, fw_len)) {
++	if (!gm_fw_load(fw, fw_len)) {
+ 		return;
+ 	}
+ 	gpu_wr(g_gmu, GMU_CM3_FW_INIT_RESULT, 0);
+ 	gpu_wr(g_gmu, GMU_CM3_BOOT_CONFIG, 2);
+ 	gpu_wr(g_gmu, GMU_HFI_QTBL_ADDR, GVA_HFI);
+ 	gpu_wr(g_gmu, GMU_HFI_QTBL_INFO, 1);
+-	gpu_wr(g_gmu, GMU_AO_AHB_FENCE_RANGE0, (1u << 31) | (0xau << 18) | 0xa0u);
++	gpu_wr(g_gmu, GMU_AO_AHB_FENCE_RANGE0, (1u << 31) | ((0xau << 2) << 18) | 0x8a0u); /* KGSL GMU_FENCE_RANGE_MASK */
+ 	gpu_wr(g_gmu, GMU_CM3_CFG, 0x4052);
+ 	gpu_wr(g_gmu, GMU_HFI_SFR_ADDR, A640_GMU_CHIPID);
+-	gpu_wr(g_gmu, GMU_PWR_COL_CP_MSG, GVA_LOG | (GVA_BUF_SIZE / 0x1000u - 1u));
++	gpu_wr(g_gmu, GMU_PWR_COL_CP_MSG, GVA_LOG | 0u);        /* KGSL LOGMEM_SIZE 4K: (4K units - 1) = 0 */
+ 	/* a6xx_gmu_power_config, idle level ACTIVE (no IFPC/SPTP collapse) */
+ 	gpu_wr(g_gmu, GMU_SYS_BUS_CONFIG, 1);
+ 	gpu_wr(g_gmu, GMU_ICACHE_CONFIG, 1);
+@@ -592,6 +600,7 @@
+ 	uint32_t mask = ver <= 0x20010004u ? 0xffffffffu : 0x1ffu, want = ver <= 0x20010004u ? 0xbabefaceu : 0x100u;
+ 	gpu_wr(g_gmu, GMU_CM3_SYSRESET, 1);
+ 	gpu_wr(g_gmu, GMU_PWR_COL_CP_RESP, 0);
++	gpu_wr(g_gmu, 0x5002u << 2, 0);                         /* KGSL A6XX_GMU_CX_GMU_WFI_CONFIG */
+ 	gpu_wr(g_gmu, GMU_CM3_SYSRESET, 0);
+ 	bool up = gpu_poll(g_gmu, GMU_CM3_FW_INIT_RESULT, mask, want, 1000);
+ 	printf("SWEET GPU: S1 GMU %s: fw-init 0x%08x (want 0x%x/0x%x) rpmh-state 0x%08x\n", up ? "BOOTED" : "boot TIMEOUT",
